@@ -20,7 +20,7 @@ export type MatchingSessionDatabaseOperation =
 
 type PersistenceDatabaseError = { code?: string; message?: string; name?: string; status?: number; statusCode?: number } | null;
 type PersistenceQueryResult = { data: unknown; error: PersistenceDatabaseError };
-type PersistenceMutationResult = { error: PersistenceDatabaseError };
+type PersistenceMutationResult = { data: unknown; error: PersistenceDatabaseError };
 export type MatchingSessionPersistenceDiagnostics = {
   stage: string;
   operation: MatchingSessionDatabaseOperation;
@@ -246,12 +246,25 @@ export class SupabaseMatchingSessionRepository {
         rowFound: true,
         createdByMatchesAdmin: existingRow.created_by === adminUserId,
       };
-      const { error } = await runPersistence<PersistenceMutationResult>('update', updateContext, () => this.client!.from(this.tableName)
+      const { data, error } = await runPersistence<PersistenceMutationResult>('update', updateContext, () => this.client!.from(this.tableName)
         .update(row)
         .eq('id', persistedSession.id)
-        .eq('created_by', adminUserId), this.diagnosticLogger);
+        .eq('created_by', adminUserId)
+        .select('id, created_by'), this.diagnosticLogger);
       if (error) {
         throw createPersistenceError('update', error, updateContext, this.diagnosticLogger);
+      }
+      const updatedRows = Array.isArray(data) ? data : data ? [data] : [];
+      const updatedRow = updatedRows.find((updated: { id?: unknown; created_by?: unknown }) => (
+        updated.id === persistedSession.id && updated.created_by === adminUserId
+      ));
+      if (!updatedRow) {
+        throw createPersistenceError(
+          'update',
+          Object.assign(new Error('Matching session update affected no row.'), { name: 'MatchingSessionUpdateNotAppliedError' }),
+          { ...updateContext, rowFound: false, createdByMatchesAdmin: false },
+          this.diagnosticLogger,
+        );
       }
       return persistedSession;
     }
@@ -265,9 +278,23 @@ export class SupabaseMatchingSessionRepository {
       rowFound: false,
       createdByMatchesAdmin: true,
     };
-    const { error } = await runPersistence<PersistenceMutationResult>('insert', insertContext, () => this.client!.from(this.tableName).insert(row), this.diagnosticLogger);
+    const { data, error } = await runPersistence<PersistenceMutationResult>('insert', insertContext, () => this.client!.from(this.tableName)
+      .insert(row)
+      .select('id, created_by'), this.diagnosticLogger);
     if (error) {
       throw createPersistenceError('insert', error, insertContext, this.diagnosticLogger);
+    }
+    const insertedRows = Array.isArray(data) ? data : data ? [data] : [];
+    const insertedRow = insertedRows.find((inserted: { id?: unknown; created_by?: unknown }) => (
+      inserted.id === persistedSession.id && inserted.created_by === adminUserId
+    ));
+    if (!insertedRow) {
+      throw createPersistenceError(
+        'insert',
+        Object.assign(new Error('Matching session insert returned no row.'), { name: 'MatchingSessionInsertNotAppliedError' }),
+        { ...insertContext, rowFound: false, createdByMatchesAdmin: false },
+        this.diagnosticLogger,
+      );
     }
 
     return persistedSession;

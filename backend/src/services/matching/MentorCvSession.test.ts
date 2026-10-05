@@ -40,10 +40,12 @@ function createRepository() {
   return new SupabaseMatchingSessionRepository({
     from: () => ({
       select: () => ({ eq: () => ({ order: () => ({ limit: async () => ({ data: [...rows.values()], error: null }) }) }) }),
-      insert: async (row: Record<string, unknown>) => {
-        rows.set(String(row.id), row);
-        return { error: null };
-      },
+      insert: (row: Record<string, unknown>) => ({
+        select: async () => {
+          rows.set(String(row.id), row);
+          return { data: [{ id: row.id, created_by: row.created_by }], error: null };
+        },
+      }),
       update: async (row: Record<string, unknown>) => {
         rows.set(String(row.id), row);
         return { error: null };
@@ -52,14 +54,19 @@ function createRepository() {
   } as never);
 }
 
-test('removes stale demo mentors that have no durable uploaded CV record', () => {
+test('legacy seed shape reconciles to five students and zero demo mentors', () => {
   const session = createSession();
-  session.mentors = [{ id: 'mentor-1', name: 'Demo mentor', cvFileIds: [] }];
+  session.mentors = Array.from({ length: 3 }, (_, index) => ({
+    id: `mentor-${index + 1}`,
+    name: `Demo mentor ${index + 1}`,
+    cvFileIds: [],
+  }));
 
   const reconciled = reconcileMentorCvSession(session);
 
   assert.deepEqual(reconciled.mentors, []);
   assert.deepEqual(reconciled.uploadedMentorFiles, []);
+  assert.equal(reconciled.students.length, 5);
 });
 
 test('persists uploaded mentor metadata and resolves the same mentor ID during matching', async () => {

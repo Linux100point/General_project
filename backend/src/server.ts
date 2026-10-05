@@ -265,6 +265,12 @@ app.post('/api/admin/matching/upload-mentor-cvs', requireAdmin, mentorUpload.arr
       updatedAt: new Date().toISOString(),
     };
     const savedSession = await sessionRepository.saveCurrentSession(user!.id, nextSession);
+    console.info('Matching mentor CV upload persisted.', {
+      uploadedFileCount: savedFiles.length,
+      mentorCount: savedSession.mentors.length,
+      uploadedMentorFileCount: savedSession.uploadedMentorFiles.filter((file) => file.kind === 'mentor-cv').length,
+      studentCount: savedSession.students.length,
+    });
     return res.json({ success: true, session: savedSession });
   } catch (error) {
     await removeTemporaryUploads(req.files as Express.Multer.File[] | undefined);
@@ -299,6 +305,12 @@ app.post('/api/admin/matching/upload-students-excel', requireAdmin, studentUploa
     };
 
     const savedSession = await sessionRepository.saveCurrentSession(user!.id, nextSession);
+    console.info('Matching student spreadsheet upload persisted.', {
+      parsedStudentCount: parsedStudents.length,
+      persistedStudentCount: savedSession.students.length,
+      mentorCount: savedSession.mentors.length,
+      uploadedMentorFileCount: savedSession.uploadedMentorFiles.filter((mentorFile) => mentorFile.kind === 'mentor-cv').length,
+    });
     return res.json({ success: true, session: savedSession });
   } catch (error) {
     if (error instanceof MatchingSessionPersistenceError) {

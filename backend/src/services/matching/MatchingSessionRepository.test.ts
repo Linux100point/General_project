@@ -3,9 +3,12 @@ import crypto from 'node:crypto';
 import { once } from 'node:events';
 import express from 'express';
 import test from 'node:test';
+import * as XLSX from 'xlsx';
 import { safeAsyncRoute } from '../../middleware/safeAsyncRoute';
+import { parseStudentsExcel } from '../excel/StudentExcelParser';
 import type { AIProvider, MatchRequestInput, MatchingSession } from '../../types';
 import { MentorCVExtractionService } from './MentorCVExtractionService';
+import { applyUploadedMentorCvFiles, reconcileMentorCvSession } from './MentorCvSession';
 import { MockAIProvider, MockMatchingService } from './MockMatchingService';
 import { OpenAIMatchingService } from './OpenAIMatchingService';
 import { createDefaultMatchingSession, MatchingSessionPersistenceError, SupabaseMatchingSessionRepository } from './MatchingSessionRepository';
@@ -51,6 +54,8 @@ function createUpdateQuery(
   rows: Map<string, Record<string, any>>,
   value: Record<string, any>,
   failure: boolean,
+  insert = false,
+  noOp = false,
 ) {
   const filters: Record<string, string> = {};
   const query = {
@@ -58,22 +63,38 @@ function createUpdateQuery(
       filters[field] = filterValue;
       return query;
     },
-    then(resolve: (value: { error: { code?: string; message: string } | null }) => unknown, reject: (reason: unknown) => unknown) {
+    select() {
+      return query;
+    },
+    then(resolve: (value: { data: unknown; error: { code?: string; status?: number; name?: string; message: string } | null }) => unknown, reject: (reason: unknown) => unknown) {
       if (failure) {
-        return Promise.resolve({ error: { code: '23505', status: 409, name: 'PostgrestError', message: 'database details omitted' } }).then(resolve, reject);
+        return Promise.resolve({
+          data: null,
+          error: { code: '23505', status: 409, name: 'PostgrestError', message: 'database details omitted' },
+        }).then(resolve, reject);
       }
 
+      if (insert) {
+        rows.set(String(value.id), { ...value });
+        return Promise.resolve({ data: [{ id: value.id, created_by: value.created_by }], error: null }).then(resolve, reject);
+      }
+      if (noOp) {
+        return Promise.resolve({ data: [], error: null }).then(resolve, reject);
+      }
       const matchingRows = [...rows.entries()].filter(([, row]) => Object.entries(filters).every(([field, filterValue]) => row[field] === filterValue));
       for (const [key, row] of matchingRows) {
         rows.set(key, { ...row, ...value });
       }
-      return Promise.resolve({ error: null }).then(resolve, reject);
+      return Promise.resolve({
+        data: matchingRows.map(([, row]) => ({ id: row.id, created_by: row.created_by })),
+        error: null,
+      }).then(resolve, reject);
     },
   };
   return query;
 }
 
-function createRepositoryHarness(failure: 'select' | 'insert' | 'update' | null = null) {
+function createRepositoryHarness(failure: 'select' | 'insert' | 'update' | 'update-noop' | null = null) {
   const rows = new Map<string, Record<string, any>>();
   const logs: unknown[][] = [];
   const client = {
@@ -89,13 +110,11 @@ function createRepositoryHarness(failure: 'select' | 'insert' | 'update' | null 
           }),
         }),
       }),
-      insert: async (row: Record<string, any>) => {
-        if (failure === 'insert') return { data: null, error: { code: '23505', status: 409, name: 'PostgrestError', message: 'database details omitted' } };
-        rows.set(String(row.id), { ...row });
-        return { data: [row], error: null };
+      insert: (row: Record<string, any>) => {
+        return createUpdateQuery(rows, row, failure === 'insert', true);
       },
       update: (row: Record<string, any>) => {
-        return createUpdateQuery(rows, row, failure === 'update');
+        return createUpdateQuery(rows, row, failure === 'update', false, failure === 'update-noop');
       },
     }),
   };
@@ -135,9 +154,8 @@ test('matching session repository creates and updates a session', async () => {
           }),
         }),
       }),
-      insert: async (value: Record<string, unknown> & { id?: string }) => {
-        rows.set(String(value.id), { ...value });
-        return { data: [value], error: null };
+      insert: (value: Record<string, unknown> & { id?: string }) => {
+        return createUpdateQuery(rows as Map<string, Record<string, any>>, value, false, true);
       },
       update: (value: Record<string, unknown> & { id?: string }) => {
         return createUpdateQuery(rows as Map<string, Record<string, any>>, value, false);
@@ -271,6 +289,120 @@ test('updating a session is scoped to its UUID and admin ownership', async () =>
   assert.equal((rows.get(ownId)?.current_result as MatchingSession).status, 'final');
   assert.equal(rows.get(otherAdminId)?.created_by, 'admin-2');
   assert.deepEqual(rows.get(otherAdminId)?.current_result, { marker: 'must remain untouched' });
+});
+
+test('a successful zero-row update cannot report an uploaded session as persisted', async () => {
+  const logs: unknown[][] = [];
+  const sessionId = crypto.randomUUID();
+  const { rows } = createRepositoryHarness();
+  rows.set(sessionId, {
+    id: sessionId,
+    created_by: 'admin-1',
+    current_result: createTestSession(),
+    original_result: {},
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const noOpRepository = new SupabaseMatchingSessionRepository({
+    from: () => ({
+      select: () => ({
+        eq: () => ({
+          order: () => ({
+            limit: async () => ({ data: [...rows.values()], error: null }),
+          }),
+        }),
+      }),
+      update: (row: Record<string, any>) => createUpdateQuery(rows, row, false, false, true),
+    }),
+  } as never, 'matching_sessions', (...args) => logs.push(args));
+
+  await assert.rejects(
+    () => noOpRepository.saveCurrentSession('admin-1', createTestSession()),
+    (error: unknown) => {
+      assert.ok(error instanceof MatchingSessionPersistenceError);
+      assert.equal(error.operation, 'update');
+      assert.equal(error.diagnostics.operation, 'session-update');
+      assert.equal(error.diagnostics.causeName, 'MatchingSessionUpdateNotAppliedError');
+      assert.equal(error.diagnostics.rowFound, false);
+      return true;
+    },
+  );
+  assert.equal(logs.length, 1);
+  assert.equal((logs[0]?.[1] as Record<string, unknown>).operation, 'session-update');
+});
+
+test('five uploaded mentors and seventeen parsed students survive sequential saves, reload, reconciliation, and reset', async () => {
+  const { repository, rows } = createRepositoryHarness();
+  const adminUserId = 'admin-1';
+  const loadForAdmin = async () => {
+    const loaded = await repository.loadCurrentSession(adminUserId, 'session-load');
+    const reconciled = reconcileMentorCvSession(loaded);
+    return reconciled === loaded
+      ? reconciled
+      : repository.saveCurrentSession(adminUserId, reconciled, 'session-load');
+  };
+
+  const initialSession = await loadForAdmin();
+  const mentorFiles = Array.from({ length: 5 }, (_, index) => ({
+    id: `cv-file-${index + 1}`,
+    originalName: `Mentor ${index + 1}.pdf`,
+    filename: `mentors/cv-file-${index + 1}.pdf`,
+    storagePath: `mentors/cv-file-${index + 1}.pdf`,
+    mimeType: 'application/pdf',
+    size: 16,
+    uploadedAt: new Date().toISOString(),
+    kind: 'mentor-cv' as const,
+  }));
+  const mentorIdentities = mentorFiles.map((_, index) => ({
+    id: `mentor-${index + 1}`,
+    name: `Mentor ${index + 1}`,
+  }));
+  const mentorUpload = applyUploadedMentorCvFiles(initialSession, mentorFiles, mentorIdentities);
+  await repository.saveCurrentSession(adminUserId, mentorUpload);
+
+  const sessionBeforeStudentUpload = await loadForAdmin();
+  assert.equal(sessionBeforeStudentUpload.mentors.length, 5);
+  assert.equal(sessionBeforeStudentUpload.uploadedMentorFiles.length, 5);
+
+  const workbook = XLSX.utils.book_new();
+  const studentRows = Array.from({ length: 17 }, (_, index) => ({
+    'Student ID': `S${String(index + 1).padStart(3, '0')}`,
+    'Full Name': `Test Student ${index + 1}`,
+  }));
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(studentRows), 'Students');
+  const studentBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  const students = parseStudentsExcel(studentBuffer);
+  assert.equal(students.length, 17);
+  const studentUpload = {
+    ...sessionBeforeStudentUpload,
+    students,
+    uploadedStudentFile: {
+      id: 'student-xlsx-record',
+      originalName: 'students.xlsx',
+      filename: 'students/students.xlsx',
+      storagePath: 'students/students.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      size: studentBuffer.length,
+      uploadedAt: new Date().toISOString(),
+      kind: 'students-excel' as const,
+    },
+  };
+  await repository.saveCurrentSession(adminUserId, studentUpload);
+
+  const loadedForMatching = await loadForAdmin();
+  assert.equal(loadedForMatching.mentors.length, 5);
+  assert.equal(loadedForMatching.students.length, 17);
+  assert.equal(loadedForMatching.uploadedMentorFiles.length, 5);
+  assert.deepEqual(loadedForMatching.mentors.map((mentor) => mentor.cvFileIds[0]), mentorFiles.map((file) => file.id));
+  assert.deepEqual(loadedForMatching.students.map((student) => student.studentId), studentRows.map((row) => row['Student ID']));
+
+  const reset = await repository.resetToOriginal(adminUserId, loadedForMatching);
+  const loadedAfterReset = await loadForAdmin();
+  assert.equal(reset.mentors.length, 5);
+  assert.equal(reset.students.length, 17);
+  assert.equal(loadedAfterReset.mentors.length, 5);
+  assert.equal(loadedAfterReset.students.length, 17);
+  assert.equal(rows.size, 1);
 });
 
 test('session load errors preserve only safe database diagnostics', async () => {
