@@ -11,9 +11,33 @@ export type MatchingSessionRepositoryRow = {
   updated_at?: string;
 };
 
+export type MatchingSessionPersistenceOperation = 'load' | 'save' | 'update' | 'insert' | 'load-original';
+
+type PersistenceDatabaseError = { code?: string; message?: string } | null;
+type PersistenceQueryResult = { data: unknown; error: PersistenceDatabaseError };
+type PersistenceMutationResult = { error: PersistenceDatabaseError };
+
+export class MatchingSessionPersistenceError extends Error {
+  constructor(readonly operation: MatchingSessionPersistenceOperation) {
+    super('Unable to persist or load the matching session.');
+    this.name = 'MatchingSessionPersistenceError';
+  }
+}
+
+async function runPersistence<T>(
+  operation: MatchingSessionPersistenceOperation,
+  action: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await action();
+  } catch {
+    throw new MatchingSessionPersistenceError(operation);
+  }
+}
+
 export function createDefaultMatchingSession(): MatchingSession {
   return {
-    id: 'session-demo',
+    id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     status: 'draft',
@@ -33,14 +57,8 @@ export class SupabaseMatchingSessionRepository {
     private readonly tableName = 'matching_sessions',
   ) {}
 
-  private getDefaultSession(adminUserId: string): MatchingSession {
-    const defaultSession = createDefaultMatchingSession();
-    return {
-      ...defaultSession,
-      id: `session-${adminUserId}`,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
+  private getDefaultSession(): MatchingSession {
+    return createDefaultMatchingSession();
   }
 
   private coerceSession(value: Partial<MatchingSession> | null | undefined, fallback: MatchingSession): MatchingSession {
@@ -62,73 +80,85 @@ export class SupabaseMatchingSessionRepository {
 
   async loadCurrentSession(adminUserId: string): Promise<MatchingSession> {
     if (!this.client) {
-      return this.getDefaultSession(adminUserId);
+      return this.getDefaultSession();
     }
 
-    const { data, error } = await this.client.from(this.tableName)
+    const { data, error } = await runPersistence<PersistenceQueryResult>('load', () => this.client!.from(this.tableName)
       .select('*')
       .eq('created_by', adminUserId)
       .order('updated_at', { ascending: false })
-      .limit(1);
+      .limit(1));
 
     if (error && error.code !== 'PGRST116') {
-      throw new Error(error.message || 'Unable to load the matching session.');
+      throw new MatchingSessionPersistenceError('load');
     }
 
     const row = Array.isArray(data) ? data[0] : null;
     if (!row) {
-      return this.getDefaultSession(adminUserId);
+      return this.getDefaultSession();
     }
 
-    const fallback = this.getDefaultSession(adminUserId);
-    return this.coerceSession(row.current_result ?? row.original_result ?? null, fallback);
+    const fallback = this.getDefaultSession();
+    return {
+      ...this.coerceSession(row.current_result ?? row.original_result ?? null, fallback),
+      id: row.id,
+    };
   }
 
   async saveCurrentSession(adminUserId: string, session: MatchingSession): Promise<MatchingSession> {
     if (!this.client) {
-      return session;
+      return { ...session, id: crypto.randomUUID() };
     }
 
     const now = new Date().toISOString();
-    const { data: existingRows, error: queryError } = await this.client.from(this.tableName)
+    const { data: existingRows, error: queryError } = await runPersistence<PersistenceQueryResult>('save', () => this.client!.from(this.tableName)
       .select('*')
       .eq('created_by', adminUserId)
       .order('updated_at', { ascending: false })
-      .limit(1);
+      .limit(1));
 
     if (queryError && queryError.code !== 'PGRST116') {
-      throw new Error(queryError.message || 'Unable to save the matching session.');
+      throw new MatchingSessionPersistenceError('save');
     }
 
     const existingRow = Array.isArray(existingRows) ? existingRows[0] : null;
+    const persistedSession = {
+      ...session,
+      id: existingRow?.id ?? crypto.randomUUID(),
+    };
+    const existingOriginalResult = existingRow?.original_result as Partial<MatchingSession> | null | undefined;
+    const hasOriginalRecommendations = Boolean(existingOriginalResult?.originalRecommendations?.length);
+    const originalResult = existingRow && hasOriginalRecommendations
+      ? existingOriginalResult
+      : {
+        ...persistedSession,
+        originalRecommendations: persistedSession.originalRecommendations,
+        currentRecommendations: persistedSession.currentRecommendations,
+        finalAssignments: persistedSession.finalAssignments,
+      };
     const row = {
-      id: existingRow?.id ?? session.id ?? crypto.randomUUID(),
+      id: persistedSession.id,
       created_by: adminUserId,
-      original_result: existingRow?.original_result ?? {
-        ...session,
-        originalRecommendations: session.originalRecommendations,
-        currentRecommendations: session.currentRecommendations,
-        finalAssignments: session.finalAssignments,
-      },
-      current_result: session,
+      original_result: originalResult,
+      current_result: persistedSession,
       created_at: existingRow?.created_at ?? session.createdAt ?? now,
       updated_at: now,
     };
 
     if (existingRow) {
-      const { error } = await this.client.from(this.tableName).update(row);
+      const { error } = await runPersistence<PersistenceMutationResult>('update', () => this.client!.from(this.tableName).update(row));
       if (error) {
-        throw new Error(error.message || 'Unable to update the matching session.');
+        throw new MatchingSessionPersistenceError('update');
       }
-      return session;
+      return persistedSession;
     }
 
-    const { error } = await this.client.from(this.tableName).insert(row);
+    const { error } = await runPersistence<PersistenceMutationResult>('insert', () => this.client!.from(this.tableName).insert(row));
     if (error) {
-      throw new Error(error.message || 'Unable to create the matching session.');
+      throw new MatchingSessionPersistenceError('insert');
     }
 
-    return session;
+    return persistedSession;
   }
 
   async resetToOriginal(adminUserId: string, session: MatchingSession): Promise<MatchingSession> {
@@ -149,14 +179,14 @@ export class SupabaseMatchingSessionRepository {
       return fallback;
     }
 
-    const { data, error } = await this.client.from(this.tableName)
+    const { data, error } = await runPersistence<PersistenceQueryResult>('load-original', () => this.client!.from(this.tableName)
       .select('*')
       .eq('created_by', adminUserId)
       .order('updated_at', { ascending: false })
-      .limit(1);
+      .limit(1));
 
     if (error && error.code !== 'PGRST116') {
-      throw new Error(error.message || 'Unable to read original recommendations.');
+      throw new MatchingSessionPersistenceError('load-original');
     }
 
     const row = Array.isArray(data) ? data[0] : null;

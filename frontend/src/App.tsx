@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { buildApiUrl } from './config';
 import { supabase } from './supabase';
+import { ApiRequestError, getActionErrorMessage } from './actionErrors';
 
 type Role = 'ADMIN' | 'STUDENT' | 'MENTOR';
 
@@ -58,88 +59,11 @@ type SessionState = {
 };
 
 const defaultSession: SessionState = {
-  mentors: [
-    { id: 'mentor-1', name: 'Mentor A', cvFileIds: [] },
-    { id: 'mentor-2', name: 'Mentor B', cvFileIds: [] },
-    { id: 'mentor-3', name: 'Mentor C', cvFileIds: [] },
-  ],
-  students: [
-    {
-      id: 'student-1',
-      name: 'Student A',
-      desiredSkills: 'React, TypeScript, APIs',
-      topicsForExpertConsultation: 'AI tooling and collaboration',
-      projectOverview: 'University platform dashboard',
-      mentorshipSupportNeeds: 'Architecture and delivery planning',
-    },
-    {
-      id: 'student-2',
-      name: 'Student B',
-      desiredSkills: 'Node.js, Express, DB',
-      topicsForExpertConsultation: 'Backend design',
-      projectOverview: 'Campus services backend',
-      mentorshipSupportNeeds: 'Testing and scale-up',
-    },
-    {
-      id: 'student-3',
-      name: 'Student C',
-      desiredSkills: 'Python, ML, evaluation',
-      topicsForExpertConsultation: 'Recommendation systems',
-      projectOverview: 'AI recommendation prototype',
-      mentorshipSupportNeeds: 'Model validation',
-    },
-    {
-      id: 'student-4',
-      name: 'Student D',
-      desiredSkills: 'UX research and product design',
-      topicsForExpertConsultation: 'User experience',
-      projectOverview: 'Student onboarding flow',
-      mentorshipSupportNeeds: 'Prototype feedback',
-    },
-    {
-      id: 'student-5',
-      name: 'Student E',
-      desiredSkills: 'Analytics, ETL',
-      topicsForExpertConsultation: 'Dashboards and automation',
-      projectOverview: 'Academic reporting platform',
-      mentorshipSupportNeeds: 'Pipeline design',
-    },
-  ],
-  currentRecommendations: [
-    { id: 'rec-1', mentorId: 'mentor-1', studentId: 'student-1', score: 94, reason: 'Strong alignment with frontend architecture and product work.', category: 'selected', source: 'ai' },
-    { id: 'rec-2', mentorId: 'mentor-1', studentId: 'student-2', score: 91, reason: 'Good overlap in backend API and team collaboration needs.', category: 'selected', source: 'ai' },
-    { id: 'rec-3', mentorId: 'mentor-1', studentId: 'student-3', score: 88, reason: 'Relevant to AI and evaluation interests.', category: 'selected', source: 'ai' },
-    { id: 'rec-4', mentorId: 'mentor-1', studentId: 'student-4', score: 85, reason: 'Assigned to Mentor B in current state.', category: 'alternative', source: 'ai', assignedToMentorId: 'mentor-2' },
-    { id: 'rec-5', mentorId: 'mentor-1', studentId: 'student-5', score: 82, reason: 'Assigned to Mentor C in current state.', category: 'alternative', source: 'ai', assignedToMentorId: 'mentor-3' },
-    { id: 'rec-6', mentorId: 'mentor-2', studentId: 'student-2', score: 87, reason: 'High match for backend-oriented guidance.', category: 'selected', source: 'ai' },
-    { id: 'rec-7', mentorId: 'mentor-2', studentId: 'student-4', score: 90, reason: 'Very strong user experience overlap.', category: 'selected', source: 'ai' },
-    { id: 'rec-8', mentorId: 'mentor-2', studentId: 'student-5', score: 84, reason: 'Useful analytics support for reporting workflows.', category: 'selected', source: 'ai' },
-    { id: 'rec-9', mentorId: 'mentor-2', studentId: 'student-1', score: 81, reason: 'Alternative currently under review.', category: 'alternative', source: 'ai' },
-    { id: 'rec-10', mentorId: 'mentor-3', studentId: 'student-3', score: 92, reason: 'Excellent match for AI experimental topics.', category: 'selected', source: 'ai' },
-    { id: 'rec-11', mentorId: 'mentor-3', studentId: 'student-5', score: 89, reason: 'Relevant automation and data pipeline focus.', category: 'selected', source: 'ai' },
-    { id: 'rec-12', mentorId: 'mentor-3', studentId: 'student-1', score: 83, reason: 'Alternate for product and systems work.', category: 'alternative', source: 'ai' },
-  ],
-  originalRecommendations: [
-    { id: 'rec-1', mentorId: 'mentor-1', studentId: 'student-1', score: 94, reason: 'Strong alignment with frontend architecture and product work.', category: 'selected', source: 'ai' },
-    { id: 'rec-2', mentorId: 'mentor-1', studentId: 'student-2', score: 91, reason: 'Good overlap in backend API and team collaboration needs.', category: 'selected', source: 'ai' },
-    { id: 'rec-3', mentorId: 'mentor-1', studentId: 'student-3', score: 88, reason: 'Relevant to AI and evaluation interests.', category: 'selected', source: 'ai' },
-    { id: 'rec-4', mentorId: 'mentor-1', studentId: 'student-4', score: 85, reason: 'Assigned to Mentor B in current state.', category: 'alternative', source: 'ai', assignedToMentorId: 'mentor-2' },
-    { id: 'rec-5', mentorId: 'mentor-1', studentId: 'student-5', score: 82, reason: 'Assigned to Mentor C in current state.', category: 'alternative', source: 'ai', assignedToMentorId: 'mentor-3' },
-    { id: 'rec-6', mentorId: 'mentor-2', studentId: 'student-2', score: 87, reason: 'High match for backend-oriented guidance.', category: 'selected', source: 'ai' },
-    { id: 'rec-7', mentorId: 'mentor-2', studentId: 'student-4', score: 90, reason: 'Very strong user experience overlap.', category: 'selected', source: 'ai' },
-    { id: 'rec-8', mentorId: 'mentor-2', studentId: 'student-5', score: 84, reason: 'Useful analytics support for reporting workflows.', category: 'selected', source: 'ai' },
-    { id: 'rec-9', mentorId: 'mentor-2', studentId: 'student-1', score: 81, reason: 'Alternative currently under review.', category: 'alternative', source: 'ai' },
-    { id: 'rec-10', mentorId: 'mentor-3', studentId: 'student-3', score: 92, reason: 'Excellent match for AI experimental topics.', category: 'selected', source: 'ai' },
-    { id: 'rec-11', mentorId: 'mentor-3', studentId: 'student-5', score: 89, reason: 'Relevant automation and data pipeline focus.', category: 'selected', source: 'ai' },
-    { id: 'rec-12', mentorId: 'mentor-3', studentId: 'student-1', score: 83, reason: 'Alternate for product and systems work.', category: 'alternative', source: 'ai' },
-  ],
-  finalAssignments: [
-    { mentorId: 'mentor-1', studentId: 'student-1' },
-    { mentorId: 'mentor-1', studentId: 'student-2' },
-    { mentorId: 'mentor-1', studentId: 'student-3' },
-    { mentorId: 'mentor-2', studentId: 'student-4' },
-    { mentorId: 'mentor-3', studentId: 'student-5' },
-  ],
+  mentors: [],
+  students: [],
+  currentRecommendations: [],
+  originalRecommendations: [],
+  finalAssignments: [],
   uploadedMentorFiles: [],
 };
 
@@ -156,12 +80,17 @@ function getFinalAssignmentsFromRecommendations(recommendations: Recommendation[
   return Array.from(byStudent.values()).map((item) => ({ mentorId: item.mentorId, studentId: item.studentId }));
 }
 
-function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
+export function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
   const [backendStatus, setBackendStatus] = useState('Checking backend...');
   const [session, setSession] = useState<SessionState>(defaultSession);
   const [mentorFiles, setMentorFiles] = useState<File[]>([]);
   const [studentFile, setStudentFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  const mentorInputRef = useRef<HTMLInputElement>(null);
+  const studentInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const fetchHealth = async () => {
@@ -179,6 +108,41 @@ function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
     fetchHealth();
   }, []);
 
+  useEffect(() => {
+    let active = true;
+
+    const loadSession = async () => {
+      setSessionLoading(true);
+      try {
+        const response = await fetch(buildApiUrl('/api/admin/matching/session'), {
+          headers: { Authorization: `Bearer ${sessionToken}` },
+        });
+        if (!response.ok) throw new ApiRequestError(response.status);
+
+        const result = await response.json();
+        if (!result.session) throw new Error('Matching session response was empty.');
+        if (active) {
+          setSession({
+            mentors: result.session.mentors ?? [],
+            students: result.session.students ?? [],
+            currentRecommendations: result.session.currentRecommendations ?? [],
+            originalRecommendations: result.session.originalRecommendations ?? [],
+            finalAssignments: result.session.finalAssignments ?? [],
+            uploadedMentorFiles: result.session.uploadedMentorFiles ?? [],
+            uploadedStudentFile: result.session.uploadedStudentFile,
+          });
+        }
+      } catch (error) {
+        if (active) setActionError(getActionErrorMessage(error));
+      } finally {
+        if (active) setSessionLoading(false);
+      }
+    };
+
+    void loadSession();
+    return () => { active = false; };
+  }, [sessionToken]);
+
   const updateCurrentSessionFromServer = async (url: string, method: string, body?: FormData | Record<string, unknown>) => {
     const headers = new Headers();
     headers.set('Authorization', `Bearer ${sessionToken}`);
@@ -194,8 +158,7 @@ function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
     });
 
     if (!response.ok) {
-      const errorResult = await response.json().catch(() => ({}));
-      throw new Error(errorResult.error || 'Request failed');
+      throw new ApiRequestError(response.status);
     }
 
     const result = await response.json();
@@ -217,88 +180,81 @@ function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
     return session.students.filter((student) => !assignedIds.has(student.id));
   }, [session]);
 
-  const handleMentorUpload = async () => {
-    if (!mentorFiles.length) return;
+  const performAction = async (action: () => Promise<void>, successMessage: string) => {
+    setActionError(null);
+    setActionSuccess(null);
     setLoading(true);
     try {
+      await action();
+      setActionSuccess(successMessage);
+    } catch (error) {
+      setActionError(getActionErrorMessage(error));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleMentorUpload = async () => {
+    if (!mentorFiles.length) {
+      setActionError('Select at least one mentor CV before uploading.');
+      return;
+    }
+    await performAction(async () => {
       const formData = new FormData();
       mentorFiles.forEach((file) => formData.append('files', file));
       await updateCurrentSessionFromServer('/api/admin/matching/upload-mentor-cvs', 'POST', formData);
       setMentorFiles([]);
-    } catch (error) {
-      console.error(error);
-    } finally {
-      setLoading(false);
-    }
+      if (mentorInputRef.current) mentorInputRef.current.value = '';
+    }, 'Mentor CVs uploaded successfully.');
   };
 
   const handleStudentUpload = async () => {
-    if (!studentFile) return;
-    setLoading(true);
-    try {
+    if (!studentFile) {
+      setActionError('Select a student Excel file before uploading.');
+      return;
+    }
+    await performAction(async () => {
       const formData = new FormData();
       formData.append('file', studentFile);
       await updateCurrentSessionFromServer('/api/admin/matching/upload-students-excel', 'POST', formData);
       setStudentFile(null);
-    } catch (error) {
-      console.error(error);
-    } finally {
-      setLoading(false);
-    }
+      if (studentInputRef.current) studentInputRef.current.value = '';
+    }, 'Student spreadsheet uploaded successfully.');
   };
 
   const handleRunMatching = async () => {
-    setLoading(true);
-    try {
+    await performAction(async () => {
       await updateCurrentSessionFromServer('/api/admin/matching/run', 'POST');
-    } catch (error) {
-      console.error(error);
-    } finally {
-      setLoading(false);
-    }
+    }, 'Matching recommendations updated.');
   };
 
   const handleSaveChanges = async () => {
     const finalAssignments = getFinalAssignmentsFromRecommendations(session.currentRecommendations);
-    setLoading(true);
-    try {
+    await performAction(async () => {
       await updateCurrentSessionFromServer('/api/admin/matching/save', 'POST', { finalAssignments });
-    } catch (error) {
-      console.error(error);
-    } finally {
-      setLoading(false);
-    }
+    }, 'Changes saved successfully.');
   };
 
   const handleReset = async () => {
-    setLoading(true);
-    try {
+    await performAction(async () => {
       await updateCurrentSessionFromServer('/api/admin/matching/reset', 'POST');
-    } catch (error) {
-      console.error(error);
-    } finally {
-      setLoading(false);
-    }
+    }, 'Recommendations restored successfully.');
   };
 
   const handleExport = async (format: 'excel' | 'pdf') => {
-    try {
+    await performAction(async () => {
       const response = await fetch(`${buildApiUrl('/api/admin/matching/export')}?format=${format}`, {
         headers: { Authorization: `Bearer ${sessionToken}` },
       });
-      if (!response.ok) {
-        throw new Error('Unable to export matching results.');
-      }
+      if (!response.ok) throw new ApiRequestError(response.status);
 
       const downloadUrl = URL.createObjectURL(await response.blob());
       const downloadLink = document.createElement('a');
       downloadLink.href = downloadUrl;
-      downloadLink.download = `matching-export.${format}`;
+      downloadLink.download = format === 'excel' ? 'matching-export.xlsx' : 'matching-export.pdf';
       downloadLink.click();
       window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
-    } catch (error) {
-      console.error(error);
-    }
+    }, `${format === 'excel' ? 'Excel' : 'PDF'} export downloaded.`);
   };
 
   const reorderSelected = (mentorId: string, studentId: string, direction: 'up' | 'down') => {
@@ -376,9 +332,13 @@ function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
           </div>
         </div>
 
+        {sessionLoading && <p role="status" style={{ background: '#fff', padding: '12px 16px', borderRadius: '8px' }}>Loading saved matching session...</p>}
+        {actionError && <div role="alert" style={{ background: '#fee2e2', color: '#991b1b', border: '1px solid #fecaca', padding: '12px 16px', borderRadius: '8px', marginBottom: '16px' }}>{actionError}</div>}
+        {actionSuccess && <div role="status" style={{ background: '#dcfce7', color: '#166534', border: '1px solid #bbf7d0', padding: '12px 16px', borderRadius: '8px', marginBottom: '16px' }}>{actionSuccess}</div>}
+
         <section style={{ background: '#ffffff', borderRadius: '16px', padding: '24px', boxShadow: '0 10px 30px rgba(0,0,0,0.08)', marginBottom: '24px' }}>
           <h2 style={{ marginTop: 0 }}>1. Upload mentor CVs</h2>
-          <input type="file" multiple accept="application/pdf" onChange={(event) => setMentorFiles(Array.from(event.target.files ?? []))} style={{ display: 'block', marginBottom: '12px' }} />
+          <input ref={mentorInputRef} type="file" multiple accept="application/pdf" disabled={loading || sessionLoading} onChange={(event) => { setActionError(null); setActionSuccess(null); setMentorFiles(Array.from(event.target.files ?? [])); }} style={{ display: 'block', marginBottom: '12px' }} />
           {mentorFiles.length > 0 && (
             <div style={{ marginBottom: '12px' }}>
               {mentorFiles.map((file, index) => (
@@ -389,23 +349,23 @@ function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
               ))}
             </div>
           )}
-          <button type="button" onClick={handleMentorUpload} disabled={loading || !mentorFiles.length} style={{ padding: '10px 14px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}>Upload mentor CVs</button>
+          <button type="button" onClick={handleMentorUpload} disabled={loading || sessionLoading || !mentorFiles.length} style={{ padding: '10px 14px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}>Upload mentor CVs</button>
         </section>
 
         <section style={{ background: '#ffffff', borderRadius: '16px', padding: '24px', boxShadow: '0 10px 30px rgba(0,0,0,0.08)', marginBottom: '24px' }}>
           <h2 style={{ marginTop: 0 }}>2. Upload students Excel</h2>
-          <input type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => setStudentFile(event.target.files?.[0] ?? null)} style={{ display: 'block', marginBottom: '12px' }} />
+          <input ref={studentInputRef} type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" disabled={loading || sessionLoading} onChange={(event) => { setActionError(null); setActionSuccess(null); setStudentFile(event.target.files?.[0] ?? null); }} style={{ display: 'block', marginBottom: '12px' }} />
           {studentFile && <div style={{ marginBottom: '12px', background: '#f9fafb', padding: '8px 12px', borderRadius: '8px' }}>Selected file: {studentFile.name}</div>}
-          <button type="button" onClick={handleStudentUpload} disabled={loading || !studentFile} style={{ padding: '10px 14px', background: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}>Upload student Excel</button>
+          <button type="button" onClick={handleStudentUpload} disabled={loading || sessionLoading || !studentFile} style={{ padding: '10px 14px', background: '#16a34a', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}>Upload student Excel</button>
         </section>
 
         <section style={{ background: '#ffffff', borderRadius: '16px', padding: '24px', boxShadow: '0 10px 30px rgba(0,0,0,0.08)', marginBottom: '24px' }}>
           <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '16px' }}>
-            <button type="button" onClick={handleRunMatching} disabled={loading} style={{ padding: '12px 18px', border: 'none', borderRadius: '10px', background: '#111827', color: '#fff', cursor: 'pointer' }}>Run Matching</button>
-            <button type="button" onClick={handleSaveChanges} disabled={loading} style={{ padding: '12px 18px', border: 'none', borderRadius: '10px', background: '#0f766e', color: '#fff', cursor: 'pointer' }}>Save Changes</button>
-            <button type="button" onClick={handleReset} disabled={loading} style={{ padding: '12px 18px', border: 'none', borderRadius: '10px', background: '#b91c1c', color: '#fff', cursor: 'pointer' }}>Reset to AI Recommendations</button>
-            <button type="button" onClick={() => void handleExport('excel')} style={{ padding: '12px 18px', border: 'none', borderRadius: '10px', background: '#e5e7eb', color: '#111827', cursor: 'pointer' }}>Export Excel</button>
-            <button type="button" onClick={() => void handleExport('pdf')} style={{ padding: '12px 18px', border: 'none', borderRadius: '10px', background: '#e5e7eb', color: '#111827', cursor: 'pointer' }}>Export PDF</button>
+            <button type="button" onClick={handleRunMatching} disabled={loading || sessionLoading} style={{ padding: '12px 18px', border: 'none', borderRadius: '10px', background: '#111827', color: '#fff', cursor: 'pointer' }}>Run Matching</button>
+            <button type="button" onClick={handleSaveChanges} disabled={loading || sessionLoading} style={{ padding: '12px 18px', border: 'none', borderRadius: '10px', background: '#0f766e', color: '#fff', cursor: 'pointer' }}>Save Changes</button>
+            <button type="button" onClick={handleReset} disabled={loading || sessionLoading} style={{ padding: '12px 18px', border: 'none', borderRadius: '10px', background: '#b91c1c', color: '#fff', cursor: 'pointer' }}>Reset to AI Recommendations</button>
+            <button type="button" onClick={() => void handleExport('excel')} disabled={loading || sessionLoading} style={{ padding: '12px 18px', border: 'none', borderRadius: '10px', background: '#e5e7eb', color: '#111827', cursor: 'pointer' }}>Export Excel</button>
+            <button type="button" onClick={() => void handleExport('pdf')} disabled={loading || sessionLoading} style={{ padding: '12px 18px', border: 'none', borderRadius: '10px', background: '#e5e7eb', color: '#111827', cursor: 'pointer' }}>Export PDF</button>
           </div>
         </section>
 

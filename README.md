@@ -84,3 +84,7 @@ An unauthenticated request receives `401`; a `STUDENT` or `MENTOR` token receive
 The backend defaults to the mock provider. To opt into the OpenAI provider, set `MATCHING_PROVIDER=openai`, set `OPENAI_API_KEY` in the root `.env`, and set `OPENAI_MATCHING_MODEL=gpt-6-astra`. The API key is backend-only; do not add a `VITE_` prefix. Mentor CV extraction uses the configured model with low reasoning effort, caches structured profiles in process memory by mentor ID and PDF SHA-256, and the cohort matching call uses high reasoning effort with strict structured output and `store: false`. The mock provider remains available with `MATCHING_PROVIDER=mock` (or by leaving the selector unset).
 
 Matching session state is persisted in Supabase. The CV profile cache is in process memory and is cleared when the server restarts. OpenAI calls are not made in automated tests and require the backend key to be configured locally.
+
+## Security / Known Limitations
+
+The backend currently uses `xlsx@0.18.5`, for which `npm audit` reports known high-severity parser advisories. Spreadsheet uploads are restricted to `ADMIN` users, and this closed university/course MVP assumes spreadsheets are provided by trusted administrators. This is a temporary, time-bounded risk acceptance. Before allowing untrusted spreadsheet uploads or moving to a broader production environment, replace or upgrade the parser to a patched, supported implementation.

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { AIRecommendationPayload, MatchRequestInput, MatchingSession, Recommendation } from '../../types';
 
 export function buildMatchingSession(input: MatchRequestInput, recommendations: AIRecommendationPayload[]): MatchingSession {
@@ -28,7 +29,7 @@ export function buildMatchingSession(input: MatchRequestInput, recommendations: 
     });
 
   return {
-    id: `session-${Date.now()}`,
+    id: randomUUID(),
     createdAt: date,
     updatedAt: date,
     status: 'draft',

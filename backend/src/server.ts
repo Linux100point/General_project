@@ -1,6 +1,7 @@
 ﻿import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import OpenAI from 'openai';
@@ -8,6 +9,7 @@ import { isSupabaseConfigured } from './auth';
 import { getFrontendOrigin, getSupabaseInviteRedirectUrl, isProductionEnvironment } from './config/runtimeConfig';
 import { supabaseAdmin } from './supabase';
 import { requireAdmin, requireAuth } from './middleware/adminAuth';
+import { safeAsyncRoute } from './middleware/safeAsyncRoute';
 import { LocalFileStorage, SupabaseFileStorage, createStorageProvider, createSupabaseStorageClient } from './services/storage/LocalFileStorage';
 import { parseStudentsExcel } from './services/excel/StudentExcelParser';
 import { MockAIProvider, MockMatchingService } from './services/matching/MockMatchingService';
@@ -15,9 +17,9 @@ import { createMentorIdFromFileName, normalizeMentorNameFromFileName } from './s
 import { InMemoryMentorProfileCache, MentorCVExtractionService, OpenAIMentorProfileExtractor } from './services/matching/MentorCVExtractionService';
 import { MatchingConfigurationError, OpenAIProvider } from './services/matching/OpenAIProvider';
 import { MatchingInputError, OpenAIMatchingService } from './services/matching/OpenAIMatchingService';
-import { BasicExportService } from './services/export/ExportService';
+import { BasicExportService, getExportMetadata } from './services/export/ExportService';
 import { enforceFinalAssignmentConstraint, buildUnassignedStudents } from './services/matching/MatchingBusinessRules';
-import { SupabaseMatchingSessionRepository, createDefaultMatchingSession } from './services/matching/MatchingSessionRepository';
+import { MatchingSessionPersistenceError, SupabaseMatchingSessionRepository } from './services/matching/MatchingSessionRepository';
 import type { MatchingService, MatchingSession, Mentor, Student, UserRole } from './types';
 
 type AuthenticatedRequest = express.Request & {
@@ -136,7 +138,7 @@ const buildDemoStudents = (): Student[] => [
 
 function createSeedSession(): MatchingSession {
   return {
-    id: 'session-demo',
+    id: randomUUID(),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     status: 'draft',
@@ -286,13 +288,13 @@ app.post('/api/admin/users/invite', requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/api/admin/matching/session', requireAdmin, async (req, res) => {
+app.get('/api/admin/matching/session', requireAdmin, safeAsyncRoute(async (req, res) => {
   const user = (req as AuthenticatedRequest).user;
-  const session = await getSessionForAdmin(user!.id);
+  const session = await sessionRepository.loadCurrentSession(user!.id);
   res.json({ session });
-});
+}));
 
-app.post('/api/admin/matching/upload-mentor-cvs', requireAdmin, mentorUpload.array('files', 5), async (req, res) => {
+app.post('/api/admin/matching/upload-mentor-cvs', requireAdmin, mentorUpload.array('files', 5), safeAsyncRoute(async (req, res) => {
   try {
     const user = (req as AuthenticatedRequest).user;
     const importedSession = await getSessionForAdmin(user!.id);
@@ -345,12 +347,16 @@ app.post('/api/admin/matching/upload-mentor-cvs', requireAdmin, mentorUpload.arr
     return res.json({ success: true, session: savedSession });
   } catch (error) {
     await removeTemporaryUploads(req.files as Express.Multer.File[] | undefined);
+    if (error instanceof MatchingSessionPersistenceError) {
+      console.error('Matching session persistence failed.', { operation: error.operation });
+      return res.status(500).json({ error: 'Unable to persist matching session.' });
+    }
     const message = error instanceof Error ? error.message : 'Unable to upload mentor CV files.';
     return res.status(400).json({ error: message });
   }
-});
+}));
 
-app.post('/api/admin/matching/upload-students-excel', requireAdmin, studentUpload.single('file'), async (req, res) => {
+app.post('/api/admin/matching/upload-students-excel', requireAdmin, studentUpload.single('file'), safeAsyncRoute(async (req, res) => {
   try {
     const user = (req as AuthenticatedRequest).user;
     const file = req.file;
@@ -374,12 +380,16 @@ app.post('/api/admin/matching/upload-students-excel', requireAdmin, studentUploa
     const savedSession = await sessionRepository.saveCurrentSession(user!.id, nextSession);
     return res.json({ success: true, session: savedSession });
   } catch (error) {
+    if (error instanceof MatchingSessionPersistenceError) {
+      console.error('Matching session persistence failed.', { operation: error.operation });
+      return res.status(500).json({ error: 'Unable to persist matching session.' });
+    }
     const message = error instanceof Error ? error.message : 'Unable to parse student Excel file.';
     return res.status(400).json({ error: message });
   }
-});
+}));
 
-app.post('/api/admin/matching/run', requireAdmin, async (req, res) => {
+app.post('/api/admin/matching/run', requireAdmin, safeAsyncRoute(async (req, res) => {
   try {
     const user = (req as AuthenticatedRequest).user;
     const session = await getSessionForAdmin(user!.id);
@@ -410,6 +420,10 @@ app.post('/api/admin/matching/run', requireAdmin, async (req, res) => {
     const savedSession = await sessionRepository.saveCurrentSession(user!.id, nextSession);
     return res.json({ success: true, session: savedSession });
   } catch (error) {
+    if (error instanceof MatchingSessionPersistenceError) {
+      console.error('Matching session persistence failed.', { operation: error.operation });
+      return res.status(500).json({ error: 'Unable to persist matching session.' });
+    }
     if (error instanceof MatchingConfigurationError) {
       return res.status(503).json({ error: 'AI matching is selected but OPENAI_API_KEY is not configured on the backend.' });
     }
@@ -419,9 +433,9 @@ app.post('/api/admin/matching/run', requireAdmin, async (req, res) => {
     console.error('Matching run failed.', { errorName: error instanceof Error ? error.name : 'UnknownError' });
     return res.status(500).json({ error: 'Unable to run matching. Check uploaded files and matching configuration.' });
   }
-});
+}));
 
-app.post('/api/admin/matching/save', requireAdmin, async (req, res) => {
+app.post('/api/admin/matching/save', requireAdmin, safeAsyncRoute(async (req, res) => {
   const user = (req as AuthenticatedRequest).user;
   const session = await getSessionForAdmin(user!.id);
   const currentAssignments = req.body?.finalAssignments ?? session.finalAssignments;
@@ -435,54 +449,39 @@ app.post('/api/admin/matching/save', requireAdmin, async (req, res) => {
 
   const savedSession = await sessionRepository.saveCurrentSession(user!.id, nextSession);
   return res.json({ success: true, session: savedSession });
-});
+}));
 
-app.post('/api/admin/matching/reset', requireAdmin, async (req, res) => {
+app.post('/api/admin/matching/reset', requireAdmin, safeAsyncRoute(async (req, res) => {
   const user = (req as AuthenticatedRequest).user;
   const session = await getSessionForAdmin(user!.id);
-  const restored: MatchingSession = {
-    ...session,
-    currentRecommendations: session.originalRecommendations,
-    finalAssignments: enforceFinalAssignmentConstraint(
-      session.originalRecommendations
-        .filter((item) => item.category === 'selected')
-        .slice(0, 3)
-        .map((item, index) => ({
-          id: `assignment-restored-${index + 1}`,
-          mentorId: item.mentorId,
-          studentId: item.studentId,
-          assignedAt: new Date().toISOString(),
-        })),
-    ),
-    status: 'draft',
-    updatedAt: new Date().toISOString(),
-  };
-
-  const savedSession = await sessionRepository.saveCurrentSession(user!.id, restored);
+  const savedSession = await sessionRepository.resetToOriginal(user!.id, session);
   return res.json({ success: true, session: savedSession });
-});
+}));
 
-app.get('/api/admin/matching/export', requireAdmin, async (req, res) => {
+app.get('/api/admin/matching/export', requireAdmin, safeAsyncRoute(async (req, res) => {
   const user = (req as AuthenticatedRequest).user;
   const session = await getSessionForAdmin(user!.id);
-  const format = (req.query.format as 'excel' | 'pdf') || 'excel';
+  const requestedFormat = req.query.format ?? 'excel';
+  if (requestedFormat !== 'excel' && requestedFormat !== 'pdf') {
+    return res.status(400).json({ error: 'Export format must be excel or pdf.' });
+  }
+  const format = requestedFormat;
+  const exportMetadata = getExportMetadata(format);
   const fileBuffer = await exportService.exportFinalMatching(session, format);
-  const exportRecord = await storage.saveBuffer(fileBuffer, `matching-export.${format}`, 'exports', format === 'excel' ? 'application/vnd.ms-excel' : 'application/pdf');
+  const exportRecord = await storage.saveBuffer(fileBuffer, exportMetadata.fileName, 'exports', exportMetadata.contentType);
   const downloadableBuffer = await storage.readFile(exportRecord);
 
-  res.setHeader('Content-Type', format === 'excel' ? 'application/vnd.ms-excel' : 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="matching-export.${format}"`);
+  res.setHeader('Content-Type', exportMetadata.contentType);
+  res.setHeader('Content-Disposition', `attachment; filename="${exportMetadata.fileName}"`);
   return res.send(downloadableBuffer);
-});
+}));
 
-app.get('/api/admin/matching/unassigned-students', requireAdmin, async (req, res) => {
+app.get('/api/admin/matching/unassigned-students', requireAdmin, safeAsyncRoute(async (req, res) => {
   const user = (req as AuthenticatedRequest).user;
   const session = await getSessionForAdmin(user!.id);
   res.json({ students: buildUnassignedStudents(session) });
-});
+}));
 
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
 });
-
-const _unusedDefaultSession = createDefaultMatchingSession();
