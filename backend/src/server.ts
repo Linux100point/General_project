@@ -1,7 +1,6 @@
 ﻿import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
-import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import OpenAI from 'openai';
@@ -14,6 +13,7 @@ import { LocalFileStorage, SupabaseFileStorage, createStorageProvider, createSup
 import { parseStudentsExcel } from './services/excel/StudentExcelParser';
 import { MockAIProvider, MockMatchingService } from './services/matching/MockMatchingService';
 import { createMentorIdFromFileName, normalizeMentorNameFromFileName } from './services/matching/MentorIdentity';
+import { applyUploadedMentorCvFiles, reconcileMentorCvSession, resolveMentorCvFile } from './services/matching/MentorCvSession';
 import { InMemoryMentorProfileCache, MentorCVExtractionService, OpenAIMentorProfileExtractor } from './services/matching/MentorCVExtractionService';
 import { MatchingConfigurationError, OpenAIProvider } from './services/matching/OpenAIProvider';
 import { MatchingInputError, OpenAIMatchingService } from './services/matching/OpenAIMatchingService';
@@ -21,7 +21,7 @@ import { createMatchingRunStageError, logMatchingRunFailure, matchingRunFailureR
 import { BasicExportService, getExportMetadata } from './services/export/ExportService';
 import { enforceFinalAssignmentConstraint, buildUnassignedStudents } from './services/matching/MatchingBusinessRules';
 import { MatchingSessionPersistenceError, SupabaseMatchingSessionRepository } from './services/matching/MatchingSessionRepository';
-import type { MatchingService, MatchingSession, Mentor, Student, UserRole } from './types';
+import type { MatchingService, MatchingSession, UserRole } from './types';
 
 type AuthenticatedRequest = express.Request & {
   user?: {
@@ -74,85 +74,6 @@ const studentUpload = multer({
   },
 });
 
-const buildDemoMentors = (): Mentor[] => [
-  { id: 'mentor-1', name: 'Mentor A', cvFileIds: [] },
-  { id: 'mentor-2', name: 'Mentor B', cvFileIds: [] },
-  { id: 'mentor-3', name: 'Mentor C', cvFileIds: [] },
-];
-
-const buildDemoStudents = (): Student[] => [
-  {
-    id: 'student-1',
-    name: 'Student A',
-    studentId: 'SDU-1001',
-    email: 'a@student.sdu.edu',
-    desiredSkills: 'React, TypeScript, backend APIs',
-    topicsForExpertConsultation: 'AI-assisted tooling, mentorship workflows',
-    projectOverview: 'Build a university project dashboard with automated matching.',
-    mentorshipSupportNeeds: 'Need guidance on architecture and implementation planning.',
-    mentorId: null,
-  },
-  {
-    id: 'student-2',
-    name: 'Student B',
-    studentId: 'SDU-1002',
-    email: 'b@student.sdu.edu',
-    desiredSkills: 'Node.js, Express, PostgreSQL',
-    topicsForExpertConsultation: 'API design and database modeling',
-    projectOverview: 'Create a backend service for educational workflows.',
-    mentorshipSupportNeeds: 'Help with scale and testing strategy.',
-    mentorId: null,
-  },
-  {
-    id: 'student-3',
-    name: 'Student C',
-    studentId: 'SDU-1003',
-    email: 'c@student.sdu.edu',
-    desiredSkills: 'Python, data analysis, machine learning',
-    topicsForExpertConsultation: 'Recommendation systems and evaluation',
-    projectOverview: 'Develop a machine learning prototype for mentorship matching.',
-    mentorshipSupportNeeds: 'Need structured feedback on model validation.',
-    mentorId: null,
-  },
-  {
-    id: 'student-4',
-    name: 'Student D',
-    studentId: 'SDU-1004',
-    email: 'd@student.sdu.edu',
-    desiredSkills: 'UX research, product thinking',
-    topicsForExpertConsultation: 'User flows and prototype testing',
-    projectOverview: 'Design the student onboarding experience for a platform.',
-    mentorshipSupportNeeds: 'Need ideas for usability improvements.',
-    mentorId: null,
-  },
-  {
-    id: 'student-5',
-    name: 'Student E',
-    studentId: 'SDU-1005',
-    email: 'e@student.sdu.edu',
-    desiredSkills: 'Data pipelines, analytics',
-    topicsForExpertConsultation: 'Automation and reporting',
-    projectOverview: 'Build dashboards for internal academic analytics.',
-    mentorshipSupportNeeds: 'Support with ETL architecture.',
-    mentorId: null,
-  },
-];
-
-function createSeedSession(): MatchingSession {
-  return {
-    id: randomUUID(),
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    status: 'draft',
-    uploadedMentorFiles: [],
-    mentors: buildDemoMentors(),
-    students: buildDemoStudents(),
-    originalRecommendations: [],
-    currentRecommendations: [],
-    finalAssignments: [],
-  };
-}
-
 function createMatchingServiceForSession(session: MatchingSession): MatchingService {
   const providerName = (process.env.MATCHING_PROVIDER || 'mock').trim().toLowerCase();
   if (providerName === 'mock') {
@@ -172,8 +93,7 @@ function createMatchingServiceForSession(session: MatchingSession): MatchingServ
   const provider = new OpenAIProvider(openAIClient, model);
 
   return new OpenAIMatchingService(provider, extractionService, async (mentor) => {
-    const cvFileId = mentor.cvFileIds.at(-1);
-    const cvFile = session.uploadedMentorFiles.find((file) => file.id === cvFileId);
+    const cvFile = resolveMentorCvFile(session, mentor);
     if (!cvFile) {
       throw createMatchingRunStageError('mentor-file-record', 'MentorFileRecordError', {
         storageProvider,
@@ -205,12 +125,11 @@ async function removeTemporaryUploads(files: Express.Multer.File[] | undefined):
 
 async function getSessionForAdmin(adminUserId: string): Promise<MatchingSession> {
   const loadedSession = await sessionRepository.loadCurrentSession(adminUserId);
-  if (loadedSession.students.length || loadedSession.mentors.length || loadedSession.currentRecommendations.length) {
-    return loadedSession;
+  const reconciledSession = reconcileMentorCvSession(loadedSession);
+  if (reconciledSession !== loadedSession) {
+    return sessionRepository.saveCurrentSession(adminUserId, reconciledSession);
   }
-
-  const seededSession = createSeedSession();
-  return sessionRepository.saveCurrentSession(adminUserId, seededSession);
+  return reconciledSession;
 }
 
 const configuredFrontendOrigin = getFrontendOrigin();
@@ -331,7 +250,7 @@ app.post('/api/admin/matching/upload-mentor-cvs', requireAdmin, mentorUpload.arr
       return res.status(400).json({ error: 'Mentor CV filenames must identify distinct mentors.' });
     }
 
-    const existingMentorIds = new Set(importedSession.uploadedMentorFiles.length ? importedSession.mentors.map((mentor) => mentor.id) : []);
+    const existingMentorIds = new Set(importedSession.mentors.map((mentor) => mentor.id));
     const incomingMentorIds = new Set(fileIdentities.map((identity) => identity.id));
     const newMentorCount = [...incomingMentorIds].filter((mentorId) => !existingMentorIds.has(mentorId)).length;
     if (existingMentorIds.size + newMentorCount > 5) {
@@ -341,25 +260,11 @@ app.post('/api/admin/matching/upload-mentor-cvs', requireAdmin, mentorUpload.arr
 
     const savedFiles = await Promise.all(uploadedFiles.map((file) => storage.save(file, 'mentor-cv')));
 
-    if (!importedSession.uploadedMentorFiles.length) {
-      importedSession.mentors = [];
-    }
-
-    importedSession.uploadedMentorFiles.push(...savedFiles);
-
-    for (const [index, file] of savedFiles.entries()) {
-      const identity = fileIdentities[index];
-      const existingMentorIndex = importedSession.mentors.findIndex((mentor) => mentor.id === identity.id);
-      const mentor = { id: identity.id, name: identity.name, cvFileIds: [file.id] };
-      if (existingMentorIndex >= 0) {
-        importedSession.mentors[existingMentorIndex] = mentor;
-      } else {
-        importedSession.mentors.push(mentor);
-      }
-    }
-
-    importedSession.updatedAt = new Date().toISOString();
-    const savedSession = await sessionRepository.saveCurrentSession(user!.id, importedSession);
+    const nextSession = {
+      ...applyUploadedMentorCvFiles(importedSession, savedFiles, fileIdentities),
+      updatedAt: new Date().toISOString(),
+    };
+    const savedSession = await sessionRepository.saveCurrentSession(user!.id, nextSession);
     return res.json({ success: true, session: savedSession });
   } catch (error) {
     await removeTemporaryUploads(req.files as Express.Multer.File[] | undefined);
