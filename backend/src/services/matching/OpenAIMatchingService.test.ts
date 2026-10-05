@@ -85,7 +85,14 @@ test('rejects cohorts outside the supported size before reading CVs', async () =
       return Buffer.alloc(0);
     },
   );
-  const tooManyStudents = [...students, { ...students[0], id: 'S016', studentId: 'S016' }];
+  const tooManyStudents = [
+    ...students,
+    ...Array.from({ length: 3 }, (_, index) => ({
+      ...students[0],
+      id: `S${String(index + 16).padStart(3, '0')}`,
+      studentId: `S${String(index + 16).padStart(3, '0')}`,
+    })),
+  ];
   const tooManyMentors = [...mentors, { id: 'mentor-6', name: 'Mentor 6', cvFileIds: ['cv-6'] }];
 
   await assert.rejects(service.run({ mentors, students: tooManyStudents }), MatchingInputError);

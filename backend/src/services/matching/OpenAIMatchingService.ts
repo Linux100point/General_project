@@ -27,8 +27,8 @@ export class OpenAIMatchingService implements MatchingService {
     if (input.mentors.length < 1 || input.mentors.length > 5) {
       throw new MatchingInputError('OpenAI matching supports one to five mentors per cohort.');
     }
-    if (input.students.length < 5 || input.students.length > 15) {
-      throw new MatchingInputError('OpenAI matching requires five to fifteen students per cohort.');
+    if (input.students.length < 5 || input.students.length > 17) {
+      throw new MatchingInputError('OpenAI matching requires five to seventeen students per cohort.');
     }
 
     const mentorProfiles = await this.extractMentorProfiles(input.mentors);
