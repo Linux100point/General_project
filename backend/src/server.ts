@@ -17,6 +17,7 @@ import { createMentorIdFromFileName, normalizeMentorNameFromFileName } from './s
 import { InMemoryMentorProfileCache, MentorCVExtractionService, OpenAIMentorProfileExtractor } from './services/matching/MentorCVExtractionService';
 import { MatchingConfigurationError, OpenAIProvider } from './services/matching/OpenAIProvider';
 import { MatchingInputError, OpenAIMatchingService } from './services/matching/OpenAIMatchingService';
+import { createMatchingRunStageError, logMatchingRunFailure, matchingRunFailureResponse, type MatchingRunStage } from './services/matching/MatchingRunDiagnostics';
 import { BasicExportService, getExportMetadata } from './services/export/ExportService';
 import { enforceFinalAssignmentConstraint, buildUnassignedStudents } from './services/matching/MatchingBusinessRules';
 import { MatchingSessionPersistenceError, SupabaseMatchingSessionRepository } from './services/matching/MatchingSessionRepository';
@@ -35,7 +36,8 @@ type AuthenticatedRequest = express.Request & {
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 const uploadRoot = path.join(process.cwd(), 'uploads');
-const storage = createStorageProvider() === 'supabase'
+const storageProvider = createStorageProvider();
+const storage = storageProvider === 'supabase'
   ? new SupabaseFileStorage(createSupabaseStorageClient(supabaseAdmin))
   : new LocalFileStorage();
 const exportService = new BasicExportService();
@@ -173,9 +175,23 @@ function createMatchingServiceForSession(session: MatchingSession): MatchingServ
     const cvFileId = mentor.cvFileIds.at(-1);
     const cvFile = session.uploadedMentorFiles.find((file) => file.id === cvFileId);
     if (!cvFile) {
-      throw new Error(`No stored CV file found for mentor "${mentor.id}".`);
+      throw createMatchingRunStageError('mentor-file-record', 'MentorFileRecordError', {
+        storageProvider,
+        mentorId: mentor.id,
+        fileRecordExists: false,
+        storageObjectPathPresent: false,
+      });
     }
-    return storage.readFile(cvFile);
+    try {
+      return await storage.readFile(cvFile);
+    } catch {
+      throw createMatchingRunStageError('mentor-cv-read', 'StorageReadError', {
+        storageProvider,
+        mentorId: mentor.id,
+        fileRecordExists: true,
+        storageObjectPathPresent: Boolean(cvFile.storagePath),
+      });
+    }
   });
 }
 
@@ -390,6 +406,7 @@ app.post('/api/admin/matching/upload-students-excel', requireAdmin, studentUploa
 }));
 
 app.post('/api/admin/matching/run', requireAdmin, safeAsyncRoute(async (req, res) => {
+  let stage: MatchingRunStage = 'session-load';
   try {
     const user = (req as AuthenticatedRequest).user;
     const session = await getSessionForAdmin(user!.id);
@@ -404,6 +421,7 @@ app.post('/api/admin/matching/run', requireAdmin, safeAsyncRoute(async (req, res
     const service = createMatchingServiceForSession(session);
     const result = await service.run({ mentors: session.mentors, students: session.students });
 
+    stage = 'response';
     const nextSession: MatchingSession = {
       ...session,
       ...result,
@@ -417,11 +435,12 @@ app.post('/api/admin/matching/run', requireAdmin, safeAsyncRoute(async (req, res
 
     nextSession.finalAssignments = enforceFinalAssignmentConstraint(nextSession.finalAssignments);
 
+    stage = 'session-persistence';
     const savedSession = await sessionRepository.saveCurrentSession(user!.id, nextSession);
     return res.json({ success: true, session: savedSession });
   } catch (error) {
     if (error instanceof MatchingSessionPersistenceError) {
-      console.error('Matching session persistence failed.', { operation: error.operation });
+      logMatchingRunFailure(error, stage);
       return res.status(500).json({ error: 'Unable to persist matching session.' });
     }
     if (error instanceof MatchingConfigurationError) {
@@ -430,8 +449,8 @@ app.post('/api/admin/matching/run', requireAdmin, safeAsyncRoute(async (req, res
     if (error instanceof MatchingInputError) {
       return res.status(400).json({ error: error.message });
     }
-    console.error('Matching run failed.', { errorName: error instanceof Error ? error.name : 'UnknownError' });
-    return res.status(500).json({ error: 'Unable to run matching. Check uploaded files and matching configuration.' });
+    logMatchingRunFailure(error, stage);
+    return res.status(500).json(matchingRunFailureResponse);
   }
 }));
 

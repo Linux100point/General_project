@@ -4,6 +4,7 @@ import type { AIProvider, MatchRequestInput, MentorProfile } from '../../types';
 import type { MentorProfileExtractor } from './MentorCVExtractionService';
 import { MentorCVExtractionService } from './MentorCVExtractionService';
 import { MatchingInputError, OpenAIMatchingService } from './OpenAIMatchingService';
+import { MatchingRunStageError } from './MatchingRunDiagnostics';
 
 const mentors = Array.from({ length: 5 }, (_, index) => ({
   id: `mentor-${index + 1}`,
@@ -111,6 +112,8 @@ test('requires an uploaded CV for every mentor in OpenAI mode', async () => {
 
   await assert.rejects(
     service.run({ mentors: [{ ...mentors[0], cvFileIds: [] }], students }),
-    /no uploaded CV/,
+    (error: unknown) => error instanceof MatchingRunStageError
+      && error.stage === 'mentor-file-record'
+      && error.name === 'MentorFileRecordError',
   );
 });

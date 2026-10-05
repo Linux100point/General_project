@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
-    "test": "tsx --test src/config/runtimeConfig.test.ts src/middleware/adminAuth.test.ts src/services/excel/StudentExcelParser.test.ts src/services/export/ExportService.test.ts src/services/matching/MentorCVExtractionService.test.ts src/services/matching/MentorIdentity.test.ts src/services/matching/MockMatchingService.test.ts src/services/matching/OpenAIMatchingService.test.ts src/services/matching/OpenAIProvider.test.ts src/services/storage/StorageAbstraction.test.ts src/services/matching/MatchingSessionRepository.test.ts",
+    "test": "tsx --test src/config/runtimeConfig.test.ts src/middleware/adminAuth.test.ts src/services/excel/StudentExcelParser.test.ts src/services/export/ExportService.test.ts src/services/matching/MentorCVExtractionService.test.ts src/services/matching/MentorIdentity.test.ts src/services/matching/MockMatchingService.test.ts src/services/matching/OpenAIMatchingService.test.ts src/services/matching/OpenAIProvider.test.ts src/services/matching/MatchingRunDiagnostics.test.ts src/services/storage/StorageAbstraction.test.ts src/services/matching/MatchingSessionRepository.test.ts",
     "start": "node dist/server.js"
   },
   "dependencies": {

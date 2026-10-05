@@ -1,6 +1,8 @@
 import type { AIProvider, MatchingService, Mentor, MentorProfile } from '../../types';
 import { MentorCVExtractionService } from './MentorCVExtractionService';
 import { buildMatchingSession } from './MatchingSessionBuilder';
+import { MatchingRunStageError, createMatchingRunStageError } from './MatchingRunDiagnostics';
+import { MatchingConfigurationError } from './OpenAIProvider';
 
 export type ReadMentorCv = (mentor: Mentor) => Promise<Buffer>;
 
@@ -32,10 +34,18 @@ export class OpenAIMatchingService implements MatchingService {
     }
 
     const mentorProfiles = await this.extractMentorProfiles(input.mentors);
-    const recommendations = await this.provider.generateRecommendations({
-      ...input,
-      mentorProfiles,
-    });
+    let recommendations;
+    try {
+      recommendations = await this.provider.generateRecommendations({
+        ...input,
+        mentorProfiles,
+      });
+    } catch (error) {
+      if (error instanceof MatchingRunStageError || error instanceof MatchingConfigurationError) {
+        throw error;
+      }
+      throw createMatchingRunStageError('ai-recommendations', 'AiRecommendationsError');
+    }
 
     return buildMatchingSession({ ...input, mentorProfiles }, recommendations);
   }
@@ -55,10 +65,33 @@ export class OpenAIMatchingService implements MatchingService {
 
         const mentor = mentors[mentorIndex];
         if (!mentor.cvFileIds.length) {
-          throw new Error(`Mentor "${mentor.id}" has no uploaded CV.`);
+          throw createMatchingRunStageError('mentor-file-record', 'MentorFileRecordError', {
+            mentorId: mentor.id,
+            fileRecordExists: false,
+            storageObjectPathPresent: false,
+          });
         }
-        const pdfBuffer = await this.readMentorCv(mentor);
-        profiles[mentorIndex] = await this.profileExtractionService.getProfile(mentor, pdfBuffer);
+        let pdfBuffer: Buffer;
+        try {
+          pdfBuffer = await this.readMentorCv(mentor);
+        } catch (error) {
+          if (error instanceof MatchingRunStageError || error instanceof MatchingConfigurationError) {
+            throw error;
+          }
+          throw createMatchingRunStageError('mentor-cv-read', 'StorageReadError', {
+            mentorId: mentor.id,
+          });
+        }
+        try {
+          profiles[mentorIndex] = await this.profileExtractionService.getProfile(mentor, pdfBuffer);
+        } catch (error) {
+          if (error instanceof MatchingRunStageError || error instanceof MatchingConfigurationError) {
+            throw error;
+          }
+          throw createMatchingRunStageError('mentor-cv-extraction', 'MentorCvExtractionError', {
+            mentorId: mentor.id,
+          });
+        }
       }
     }));
 
