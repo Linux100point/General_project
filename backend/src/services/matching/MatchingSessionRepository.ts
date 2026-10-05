@@ -12,11 +12,23 @@ export type MatchingSessionRepositoryRow = {
 };
 
 export type MatchingSessionPersistenceOperation = 'load' | 'save' | 'update' | 'insert' | 'load-original';
+export type MatchingSessionDatabaseOperation =
+  | 'session-select'
+  | 'session-insert'
+  | 'session-update'
+  | 'session-original-select';
 
-type PersistenceDatabaseError = { code?: string; message?: string; name?: string; status?: number } | null;
+type PersistenceDatabaseError = { code?: string; message?: string; name?: string; status?: number; statusCode?: number } | null;
 type PersistenceQueryResult = { data: unknown; error: PersistenceDatabaseError };
 type PersistenceMutationResult = { error: PersistenceDatabaseError };
-type PersistenceErrorDetails = {
+export type MatchingSessionPersistenceDiagnostics = {
+  stage: string;
+  operation: MatchingSessionDatabaseOperation;
+  sessionIdExists: boolean;
+  sessionIdIsValidUuid: boolean;
+  createdByExists: boolean;
+  rowFound: boolean | null;
+  createdByMatchesAdmin: boolean | null;
   databaseErrorCode?: string;
   httpStatus?: number;
   causeName?: string;
@@ -25,28 +37,65 @@ type PersistenceErrorDetails = {
 export class MatchingSessionPersistenceError extends Error {
   constructor(
     readonly operation: MatchingSessionPersistenceOperation,
-    readonly details: PersistenceErrorDetails = {},
+    readonly diagnostics: MatchingSessionPersistenceDiagnostics,
   ) {
     super('Unable to persist or load the matching session.');
     this.name = 'MatchingSessionPersistenceError';
   }
 }
 
-function toPersistenceError(operation: MatchingSessionPersistenceOperation, error: unknown): MatchingSessionPersistenceError {
-  const details = typeof error === 'object' && error !== null
-    ? error as { code?: unknown; status?: unknown; name?: unknown }
-    : {};
+type PersistenceDiagnosticContext = Omit<MatchingSessionPersistenceDiagnostics, 'databaseErrorCode' | 'httpStatus' | 'causeName'>;
+type MatchingSessionDiagnosticLogger = (message: string, details: Record<string, unknown>) => void;
 
-  return new MatchingSessionPersistenceError(operation, {
-    ...(typeof details.code === 'string' ? { databaseErrorCode: details.code } : {}),
-    ...(typeof details.status === 'number' ? { httpStatus: details.status } : {}),
-    ...(typeof details.name === 'string' ? { causeName: details.name } : {}),
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const safeErrorCodePattern = /^[A-Za-z0-9_.-]{1,40}$/;
+const safeErrorNamePattern = /^[A-Za-z][A-Za-z0-9_.-]{0,79}$/;
+
+function createPersistenceError(
+  legacyOperation: MatchingSessionPersistenceOperation,
+  error: unknown,
+  context: PersistenceDiagnosticContext,
+  logger: MatchingSessionDiagnosticLogger,
+): MatchingSessionPersistenceError {
+  const cause = typeof error === 'object' && error !== null
+    ? error as { code?: unknown; name?: unknown; status?: unknown; statusCode?: unknown }
+    : {};
+  const causeName = typeof cause.name === 'string' && safeErrorNamePattern.test(cause.name)
+    ? cause.name
+    : error instanceof Error && safeErrorNamePattern.test(error.name) ? error.name : 'UnknownError';
+  const errorCode = typeof cause.code === 'string' && safeErrorCodePattern.test(cause.code)
+    ? cause.code
+    : undefined;
+  const status = typeof cause.status === 'number' ? cause.status : cause.statusCode;
+  const diagnostics: MatchingSessionPersistenceDiagnostics = {
+    ...context,
+    ...(errorCode ? { databaseErrorCode: errorCode } : {}),
+    ...(typeof status === 'number' && status >= 100 && status <= 599 ? { httpStatus: status } : {}),
+    causeName,
+  };
+  const persistenceError = new MatchingSessionPersistenceError(legacyOperation, diagnostics);
+
+  logger('Matching session database operation failed.', {
+    stage: diagnostics.stage,
+    operation: diagnostics.operation,
+    errorName: persistenceError.name,
+    causeName: diagnostics.causeName,
+    sessionIdExists: diagnostics.sessionIdExists,
+    sessionIdIsValidUuid: diagnostics.sessionIdIsValidUuid,
+    createdByExists: diagnostics.createdByExists,
+    rowFound: diagnostics.rowFound,
+    createdByMatchesAdmin: diagnostics.createdByMatchesAdmin,
+    ...(diagnostics.databaseErrorCode ? { databaseErrorCode: diagnostics.databaseErrorCode } : {}),
+    ...(diagnostics.httpStatus !== undefined ? { httpStatus: diagnostics.httpStatus } : {}),
   });
+  return persistenceError;
 }
 
 async function runPersistence<T>(
   operation: MatchingSessionPersistenceOperation,
+  context: PersistenceDiagnosticContext,
   action: () => Promise<T>,
+  logger: MatchingSessionDiagnosticLogger,
 ): Promise<T> {
   try {
     return await action();
@@ -54,7 +103,7 @@ async function runPersistence<T>(
     if (error instanceof MatchingSessionPersistenceError) {
       throw error;
     }
-    throw toPersistenceError(operation, error);
+    throw createPersistenceError(operation, error, context, logger);
   }
 }
 
@@ -78,6 +127,7 @@ export class SupabaseMatchingSessionRepository {
   constructor(
     private readonly client: { from: (table: string) => any } | null = supabaseAdmin,
     private readonly tableName = 'matching_sessions',
+    private readonly diagnosticLogger: MatchingSessionDiagnosticLogger = console.error,
   ) {}
 
   private getDefaultSession(): MatchingSession {
@@ -101,19 +151,28 @@ export class SupabaseMatchingSessionRepository {
     };
   }
 
-  async loadCurrentSession(adminUserId: string): Promise<MatchingSession> {
+  async loadCurrentSession(adminUserId: string, stage = 'session-load'): Promise<MatchingSession> {
     if (!this.client) {
       return this.getDefaultSession();
     }
 
-    const { data, error } = await runPersistence<PersistenceQueryResult>('load', () => this.client!.from(this.tableName)
+    const context: PersistenceDiagnosticContext = {
+      stage,
+      operation: 'session-select',
+      sessionIdExists: false,
+      sessionIdIsValidUuid: false,
+      createdByExists: Boolean(adminUserId),
+      rowFound: null,
+      createdByMatchesAdmin: null,
+    };
+    const { data, error } = await runPersistence<PersistenceQueryResult>('load', context, () => this.client!.from(this.tableName)
       .select('*')
       .eq('created_by', adminUserId)
       .order('updated_at', { ascending: false })
-      .limit(1));
+      .limit(1), this.diagnosticLogger);
 
     if (error && error.code !== 'PGRST116') {
-      throw toPersistenceError('load', error);
+      throw createPersistenceError('load', error, context, this.diagnosticLogger);
     }
 
     const row = Array.isArray(data) ? data[0] : null;
@@ -128,20 +187,29 @@ export class SupabaseMatchingSessionRepository {
     };
   }
 
-  async saveCurrentSession(adminUserId: string, session: MatchingSession): Promise<MatchingSession> {
+  async saveCurrentSession(adminUserId: string, session: MatchingSession, stage = 'session-persistence'): Promise<MatchingSession> {
     if (!this.client) {
       return { ...session, id: crypto.randomUUID() };
     }
 
     const now = new Date().toISOString();
-    const { data: existingRows, error: queryError } = await runPersistence<PersistenceQueryResult>('save', () => this.client!.from(this.tableName)
+    const selectContext: PersistenceDiagnosticContext = {
+      stage,
+      operation: 'session-select',
+      sessionIdExists: Boolean(session.id),
+      sessionIdIsValidUuid: uuidPattern.test(session.id),
+      createdByExists: Boolean(adminUserId),
+      rowFound: null,
+      createdByMatchesAdmin: null,
+    };
+    const { data: existingRows, error: queryError } = await runPersistence<PersistenceQueryResult>('save', selectContext, () => this.client!.from(this.tableName)
       .select('*')
       .eq('created_by', adminUserId)
       .order('updated_at', { ascending: false })
-      .limit(1));
+      .limit(1), this.diagnosticLogger);
 
     if (queryError && queryError.code !== 'PGRST116') {
-      throw toPersistenceError('save', queryError);
+      throw createPersistenceError('save', queryError, selectContext, this.diagnosticLogger);
     }
 
     const existingRow = Array.isArray(existingRows) ? existingRows[0] : null;
@@ -169,19 +237,37 @@ export class SupabaseMatchingSessionRepository {
     };
 
     if (existingRow) {
-      const { error } = await runPersistence<PersistenceMutationResult>('update', () => this.client!.from(this.tableName)
+      const updateContext: PersistenceDiagnosticContext = {
+        stage,
+        operation: 'session-update',
+        sessionIdExists: Boolean(persistedSession.id),
+        sessionIdIsValidUuid: uuidPattern.test(persistedSession.id),
+        createdByExists: Boolean(existingRow.created_by),
+        rowFound: true,
+        createdByMatchesAdmin: existingRow.created_by === adminUserId,
+      };
+      const { error } = await runPersistence<PersistenceMutationResult>('update', updateContext, () => this.client!.from(this.tableName)
         .update(row)
         .eq('id', persistedSession.id)
-        .eq('created_by', adminUserId));
+        .eq('created_by', adminUserId), this.diagnosticLogger);
       if (error) {
-        throw toPersistenceError('update', error);
+        throw createPersistenceError('update', error, updateContext, this.diagnosticLogger);
       }
       return persistedSession;
     }
 
-    const { error } = await runPersistence<PersistenceMutationResult>('insert', () => this.client!.from(this.tableName).insert(row));
+    const insertContext: PersistenceDiagnosticContext = {
+      stage,
+      operation: 'session-insert',
+      sessionIdExists: Boolean(persistedSession.id),
+      sessionIdIsValidUuid: uuidPattern.test(persistedSession.id),
+      createdByExists: Boolean(adminUserId),
+      rowFound: false,
+      createdByMatchesAdmin: true,
+    };
+    const { error } = await runPersistence<PersistenceMutationResult>('insert', insertContext, () => this.client!.from(this.tableName).insert(row), this.diagnosticLogger);
     if (error) {
-      throw toPersistenceError('insert', error);
+      throw createPersistenceError('insert', error, insertContext, this.diagnosticLogger);
     }
 
     return persistedSession;
@@ -205,14 +291,23 @@ export class SupabaseMatchingSessionRepository {
       return fallback;
     }
 
-    const { data, error } = await runPersistence<PersistenceQueryResult>('load-original', () => this.client!.from(this.tableName)
+    const context: PersistenceDiagnosticContext = {
+      stage: 'session-load',
+      operation: 'session-original-select',
+      sessionIdExists: Boolean(fallback.id),
+      sessionIdIsValidUuid: uuidPattern.test(fallback.id),
+      createdByExists: Boolean(adminUserId),
+      rowFound: null,
+      createdByMatchesAdmin: null,
+    };
+    const { data, error } = await runPersistence<PersistenceQueryResult>('load-original', context, () => this.client!.from(this.tableName)
       .select('*')
       .eq('created_by', adminUserId)
       .order('updated_at', { ascending: false })
-      .limit(1));
+      .limit(1), this.diagnosticLogger);
 
     if (error && error.code !== 'PGRST116') {
-      throw toPersistenceError('load-original', error);
+      throw createPersistenceError('load-original', error, context, this.diagnosticLogger);
     }
 
     const row = Array.isArray(data) ? data[0] : null;

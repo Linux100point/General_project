@@ -87,6 +87,13 @@ test('logs session-load persistence failures with operation and safe database de
   const logged: unknown[][] = [];
   logMatchingRunFailure(
     new MatchingSessionPersistenceError('update', {
+      stage: 'session-load',
+      operation: 'session-update',
+      sessionIdExists: true,
+      sessionIdIsValidUuid: true,
+      createdByExists: true,
+      rowFound: true,
+      createdByMatchesAdmin: true,
       databaseErrorCode: '23505',
       httpStatus: 409,
       causeName: 'PostgrestError',
@@ -100,10 +107,15 @@ test('logs session-load persistence failures with operation and safe database de
     {
       stage: 'session-load',
       errorName: 'MatchingSessionPersistenceError',
-      operation: 'update',
+      operation: 'session-update',
       databaseErrorCode: '23505',
       httpStatus: 409,
       causeName: 'PostgrestError',
+      sessionIdExists: true,
+      sessionIdIsValidUuid: true,
+      createdByExists: true,
+      rowFound: true,
+      createdByMatchesAdmin: true,
     },
   ]]);
 });

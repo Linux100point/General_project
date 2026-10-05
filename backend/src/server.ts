@@ -124,10 +124,10 @@ async function removeTemporaryUploads(files: Express.Multer.File[] | undefined):
 }
 
 async function getSessionForAdmin(adminUserId: string): Promise<MatchingSession> {
-  const loadedSession = await sessionRepository.loadCurrentSession(adminUserId);
+  const loadedSession = await sessionRepository.loadCurrentSession(adminUserId, 'session-load');
   const reconciledSession = reconcileMentorCvSession(loadedSession);
   if (reconciledSession !== loadedSession) {
-    return sessionRepository.saveCurrentSession(adminUserId, reconciledSession);
+    return sessionRepository.saveCurrentSession(adminUserId, reconciledSession, 'session-load');
   }
   return reconciledSession;
 }

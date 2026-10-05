@@ -33,6 +33,35 @@ export function createMatchingRunStageError(
   return new MatchingRunStageError(stage, errorName, details);
 }
 
+export function getMatchingSessionPersistenceLogDetails(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error) || error.name !== 'MatchingSessionPersistenceError') {
+    return {};
+  }
+
+  const persistenceError = error as Error & { operation?: unknown; diagnostics?: unknown };
+  const diagnostics = typeof persistenceError.diagnostics === 'object' && persistenceError.diagnostics !== null
+    ? persistenceError.diagnostics as Record<string, unknown>
+    : {};
+  const operation = typeof diagnostics.operation === 'string'
+    ? diagnostics.operation
+    : typeof persistenceError.operation === 'string' ? persistenceError.operation : undefined;
+
+  return {
+    ...(typeof diagnostics.stage === 'string' ? { stage: diagnostics.stage } : {}),
+    ...(operation ? { operation } : {}),
+    ...(typeof diagnostics.databaseErrorCode === 'string' ? { databaseErrorCode: diagnostics.databaseErrorCode } : {}),
+    ...(typeof diagnostics.httpStatus === 'number' ? { httpStatus: diagnostics.httpStatus } : {}),
+    ...(typeof diagnostics.causeName === 'string' ? { causeName: diagnostics.causeName } : {}),
+    ...(typeof diagnostics.sessionIdExists === 'boolean' ? { sessionIdExists: diagnostics.sessionIdExists } : {}),
+    ...(typeof diagnostics.sessionIdIsValidUuid === 'boolean' ? { sessionIdIsValidUuid: diagnostics.sessionIdIsValidUuid } : {}),
+    ...(typeof diagnostics.createdByExists === 'boolean' ? { createdByExists: diagnostics.createdByExists } : {}),
+    ...(typeof diagnostics.rowFound === 'boolean' || diagnostics.rowFound === null ? { rowFound: diagnostics.rowFound } : {}),
+    ...(typeof diagnostics.createdByMatchesAdmin === 'boolean' || diagnostics.createdByMatchesAdmin === null
+      ? { createdByMatchesAdmin: diagnostics.createdByMatchesAdmin }
+      : {}),
+  };
+}
+
 export function logMatchingRunFailure(
   error: unknown,
   fallbackStage: MatchingRunStage,
@@ -48,17 +77,10 @@ export function logMatchingRunFailure(
   }
 
   if (error instanceof Error && error.name === 'MatchingSessionPersistenceError') {
-    const persistenceError = error as Error & { operation?: unknown; details?: unknown };
-    const details = typeof persistenceError.details === 'object' && persistenceError.details !== null
-      ? persistenceError.details as { databaseErrorCode?: unknown; httpStatus?: unknown; causeName?: unknown }
-      : {};
     logger('Matching run failed.', {
       stage: fallbackStage,
       errorName: error.name,
-      ...(typeof persistenceError.operation === 'string' ? { operation: persistenceError.operation } : {}),
-      ...(typeof details.databaseErrorCode === 'string' ? { databaseErrorCode: details.databaseErrorCode } : {}),
-      ...(typeof details.httpStatus === 'number' ? { httpStatus: details.httpStatus } : {}),
-      ...(typeof details.causeName === 'string' ? { causeName: details.causeName } : {}),
+      ...getMatchingSessionPersistenceLogDetails(error),
     });
     return;
   }

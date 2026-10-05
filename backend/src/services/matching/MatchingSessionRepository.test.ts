@@ -9,6 +9,7 @@ import { MentorCVExtractionService } from './MentorCVExtractionService';
 import { MockAIProvider, MockMatchingService } from './MockMatchingService';
 import { OpenAIMatchingService } from './OpenAIMatchingService';
 import { createDefaultMatchingSession, MatchingSessionPersistenceError, SupabaseMatchingSessionRepository } from './MatchingSessionRepository';
+import { logMatchingRunFailure } from './MatchingRunDiagnostics';
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -59,7 +60,7 @@ function createUpdateQuery(
     },
     then(resolve: (value: { error: { code?: string; message: string } | null }) => unknown, reject: (reason: unknown) => unknown) {
       if (failure) {
-        return Promise.resolve({ error: { code: '23505', message: 'database details omitted' } }).then(resolve, reject);
+        return Promise.resolve({ error: { code: '23505', status: 409, name: 'PostgrestError', message: 'database details omitted' } }).then(resolve, reject);
       }
 
       const matchingRows = [...rows.entries()].filter(([, row]) => Object.entries(filters).every(([field, filterValue]) => row[field] === filterValue));
@@ -74,13 +75,14 @@ function createUpdateQuery(
 
 function createRepositoryHarness(failure: 'select' | 'insert' | 'update' | null = null) {
   const rows = new Map<string, Record<string, any>>();
+  const logs: unknown[][] = [];
   const client = {
     from: () => ({
       select: () => ({
         eq: (_field: string, adminId: string) => ({
           order: () => ({
             limit: async () => {
-              if (failure === 'select') return { data: null, error: { code: '42501', status: 403, message: 'database details omitted' } };
+              if (failure === 'select') return { data: null, error: { code: '42501', status: 403, name: 'PostgrestError', message: 'database details omitted' } };
               const matchingRows = [...rows.values()].filter((row) => row.created_by === adminId);
               return { data: matchingRows.slice(0, 1), error: null };
             },
@@ -88,7 +90,7 @@ function createRepositoryHarness(failure: 'select' | 'insert' | 'update' | null 
         }),
       }),
       insert: async (row: Record<string, any>) => {
-        if (failure === 'insert') return { data: null, error: { message: 'database details omitted' } };
+        if (failure === 'insert') return { data: null, error: { code: '23505', status: 409, name: 'PostgrestError', message: 'database details omitted' } };
         rows.set(String(row.id), { ...row });
         return { data: [row], error: null };
       },
@@ -99,8 +101,9 @@ function createRepositoryHarness(failure: 'select' | 'insert' | 'update' | null 
   };
 
   return {
-    repository: new SupabaseMatchingSessionRepository(client as never),
+    repository: new SupabaseMatchingSessionRepository(client as never, 'matching_sessions', (...args) => logs.push(args)),
     rows,
+    logs,
   };
 }
 
@@ -271,19 +274,126 @@ test('updating a session is scoped to its UUID and admin ownership', async () =>
 });
 
 test('session load errors preserve only safe database diagnostics', async () => {
-  const { repository } = createRepositoryHarness('select');
+  const { repository, logs } = createRepositoryHarness('select');
 
   await assert.rejects(
     () => repository.loadCurrentSession('admin-1'),
     (error: unknown) => {
       assert.ok(error instanceof MatchingSessionPersistenceError);
       assert.equal(error.operation, 'load');
-      assert.equal(error.details.databaseErrorCode, '42501');
-      assert.equal(error.details.httpStatus, 403);
+      assert.equal(error.diagnostics.operation, 'session-select');
+      assert.equal(error.diagnostics.databaseErrorCode, '42501');
+      assert.equal(error.diagnostics.httpStatus, 403);
+      assert.equal(error.diagnostics.causeName, 'PostgrestError');
+      assert.equal(error.diagnostics.sessionIdExists, false);
+      assert.equal(error.diagnostics.sessionIdIsValidUuid, false);
+      assert.equal(error.diagnostics.createdByExists, true);
+      assert.equal(error.diagnostics.rowFound, null);
+      assert.equal(error.diagnostics.createdByMatchesAdmin, null);
       assert.doesNotMatch(JSON.stringify(error), /database details omitted/);
       return true;
     },
   );
+  assert.deepEqual(logs[0], [
+    'Matching session database operation failed.',
+    {
+      stage: 'session-load',
+      operation: 'session-select',
+      errorName: 'MatchingSessionPersistenceError',
+      causeName: 'PostgrestError',
+      sessionIdExists: false,
+      sessionIdIsValidUuid: false,
+      createdByExists: true,
+      rowFound: null,
+      createdByMatchesAdmin: null,
+      databaseErrorCode: '42501',
+      httpStatus: 403,
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(logs), /database details omitted/);
+});
+
+test('session insert errors preserve safe operation context and database details', async () => {
+  const { repository, logs } = createRepositoryHarness('insert');
+
+  await assert.rejects(
+    () => repository.saveCurrentSession('admin-1', createTestSession()),
+    (error: unknown) => {
+      assert.ok(error instanceof MatchingSessionPersistenceError);
+      assert.equal(error.operation, 'insert');
+      assert.equal(error.diagnostics.operation, 'session-insert');
+      assert.equal(error.diagnostics.databaseErrorCode, '23505');
+      assert.equal(error.diagnostics.httpStatus, 409);
+      assert.equal(error.diagnostics.sessionIdIsValidUuid, true);
+      assert.equal(error.diagnostics.createdByExists, true);
+      assert.equal(error.diagnostics.rowFound, false);
+      assert.equal(error.diagnostics.createdByMatchesAdmin, true);
+      return true;
+    },
+  );
+  assert.equal((logs[0]?.[1] as Record<string, unknown>).operation, 'session-insert');
+});
+
+test('session update errors preserve the selected UUID and admin ownership context', async () => {
+  const { repository, rows, logs } = createRepositoryHarness('update');
+  const sessionId = crypto.randomUUID();
+  rows.set(sessionId, {
+    id: sessionId,
+    created_by: 'admin-1',
+    current_result: createTestSession(),
+    original_result: {},
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  await assert.rejects(
+    () => repository.saveCurrentSession('admin-1', createTestSession()),
+    (error: unknown) => {
+      assert.ok(error instanceof MatchingSessionPersistenceError);
+      assert.equal(error.operation, 'update');
+      assert.equal(error.diagnostics.operation, 'session-update');
+      assert.equal(error.diagnostics.databaseErrorCode, '23505');
+      assert.equal(error.diagnostics.httpStatus, 409);
+      assert.equal(error.diagnostics.sessionIdExists, true);
+      assert.equal(error.diagnostics.sessionIdIsValidUuid, true);
+      assert.equal(error.diagnostics.createdByExists, true);
+      assert.equal(error.diagnostics.rowFound, true);
+      assert.equal(error.diagnostics.createdByMatchesAdmin, true);
+      return true;
+    },
+  );
+  assert.equal((logs[0]?.[1] as Record<string, unknown>).operation, 'session-update');
+});
+
+test('outer matching-run failure logging preserves repository diagnostics and stage', async () => {
+  const { repository } = createRepositoryHarness('select');
+  const logs: unknown[][] = [];
+  let persistenceError: unknown;
+  try {
+    await repository.loadCurrentSession('admin-1');
+  } catch (error) {
+    persistenceError = error;
+  }
+
+  logMatchingRunFailure(persistenceError, 'session-load', (...args) => logs.push(args));
+
+  assert.deepEqual(logs, [[
+    'Matching run failed.',
+    {
+      stage: 'session-load',
+      errorName: 'MatchingSessionPersistenceError',
+      operation: 'session-select',
+      databaseErrorCode: '42501',
+      httpStatus: 403,
+      causeName: 'PostgrestError',
+      sessionIdExists: false,
+      sessionIdIsValidUuid: false,
+      createdByExists: true,
+      rowFound: null,
+      createdByMatchesAdmin: null,
+    },
+  ]]);
+  assert.doesNotMatch(JSON.stringify(logs), /database details omitted/);
 });
 
 test('legacy session-demo is never persisted as matching_sessions.id', async () => {
@@ -428,7 +538,22 @@ test('matching persistence failure returns HTTP 500 without terminating the Expr
     const failedResponse = await fetch(`http://127.0.0.1:${address.port}/matching`, { method: 'POST' });
     assert.equal(failedResponse.status, 500);
     assert.deepEqual(await failedResponse.json(), { error: 'Unable to complete the matching request.' });
-    assert.deepEqual(logged, [['Matching route failed.', { errorName: 'MatchingSessionPersistenceError' }]]);
+    assert.deepEqual(logged, [[
+      'Matching route failed.',
+      {
+        errorName: 'MatchingSessionPersistenceError',
+        stage: 'session-persistence',
+        operation: 'session-insert',
+        causeName: 'PostgrestError',
+        sessionIdExists: true,
+        sessionIdIsValidUuid: true,
+        createdByExists: true,
+        rowFound: false,
+        createdByMatchesAdmin: true,
+        databaseErrorCode: '23505',
+        httpStatus: 409,
+      },
+    ]]);
 
     const healthResponse = await fetch(`http://127.0.0.1:${address.port}/health`);
     assert.equal(healthResponse.status, 200);
