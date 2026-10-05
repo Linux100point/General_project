@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { once } from 'node:events';
 import express from 'express';
 import test from 'node:test';
@@ -45,6 +46,32 @@ function createTestSession(id = 'session-demo'): MatchingSession {
   };
 }
 
+function createUpdateQuery(
+  rows: Map<string, Record<string, any>>,
+  value: Record<string, any>,
+  failure: boolean,
+) {
+  const filters: Record<string, string> = {};
+  const query = {
+    eq(field: string, filterValue: string) {
+      filters[field] = filterValue;
+      return query;
+    },
+    then(resolve: (value: { error: { code?: string; message: string } | null }) => unknown, reject: (reason: unknown) => unknown) {
+      if (failure) {
+        return Promise.resolve({ error: { code: '23505', message: 'database details omitted' } }).then(resolve, reject);
+      }
+
+      const matchingRows = [...rows.entries()].filter(([, row]) => Object.entries(filters).every(([field, filterValue]) => row[field] === filterValue));
+      for (const [key, row] of matchingRows) {
+        rows.set(key, { ...row, ...value });
+      }
+      return Promise.resolve({ error: null }).then(resolve, reject);
+    },
+  };
+  return query;
+}
+
 function createRepositoryHarness(failure: 'select' | 'insert' | 'update' | null = null) {
   const rows = new Map<string, Record<string, any>>();
   const client = {
@@ -53,7 +80,7 @@ function createRepositoryHarness(failure: 'select' | 'insert' | 'update' | null 
         eq: (_field: string, adminId: string) => ({
           order: () => ({
             limit: async () => {
-              if (failure === 'select') return { data: null, error: { message: 'database details omitted' } };
+              if (failure === 'select') return { data: null, error: { code: '42501', status: 403, message: 'database details omitted' } };
               const matchingRows = [...rows.values()].filter((row) => row.created_by === adminId);
               return { data: matchingRows.slice(0, 1), error: null };
             },
@@ -65,11 +92,8 @@ function createRepositoryHarness(failure: 'select' | 'insert' | 'update' | null 
         rows.set(String(row.id), { ...row });
         return { data: [row], error: null };
       },
-      update: async (row: Record<string, any>) => {
-        if (failure === 'update') return { data: null, error: { message: 'database details omitted' } };
-        const existing = rows.get(String(row.id)) ?? {};
-        rows.set(String(row.id), { ...existing, ...row });
-        return { data: [rows.get(String(row.id))], error: null };
+      update: (row: Record<string, any>) => {
+        return createUpdateQuery(rows, row, failure === 'update');
       },
     }),
   };
@@ -112,11 +136,8 @@ test('matching session repository creates and updates a session', async () => {
         rows.set(String(value.id), { ...value });
         return { data: [value], error: null };
       },
-      update: async (value: Record<string, unknown> & { id?: string }) => {
-        const key = String(value.id);
-        const row = rows.get(key) ?? {};
-        rows.set(key, { ...row, ...value });
-        return { data: [rows.get(key)], error: null };
+      update: (value: Record<string, unknown> & { id?: string }) => {
+        return createUpdateQuery(rows as Map<string, Record<string, any>>, value, false);
       },
     }),
   } as never, 'matching_sessions');
@@ -188,6 +209,81 @@ test('missing matching session loads an empty UUID-backed default without insert
   assert.deepEqual(loaded.originalRecommendations, []);
   assert.deepEqual(loaded.finalAssignments, []);
   assert.equal(rows.size, 0);
+});
+
+test('session loading selects only the authenticated admin and prefers the database UUID over a legacy JSON ID', async () => {
+  const { repository, rows } = createRepositoryHarness();
+  const sessionId = crypto.randomUUID();
+  rows.set(sessionId, {
+    id: sessionId,
+    created_by: 'admin-1',
+    current_result: { ...createTestSession('session-demo'), id: 'session-demo' },
+    original_result: {},
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const otherAdminSessionId = crypto.randomUUID();
+  rows.set(otherAdminSessionId, {
+    id: otherAdminSessionId,
+    created_by: 'admin-2',
+    current_result: { ...createTestSession('other-admin-session'), mentors: [{ id: 'other', name: 'Other', cvFileIds: [] }] },
+    original_result: {},
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  const loaded = await repository.loadCurrentSession('admin-1');
+
+  assert.equal(loaded.id, sessionId);
+  assert.equal(loaded.mentors[0]?.id, 'mentor-1');
+  assert.notEqual(loaded.id, 'session-demo');
+});
+
+test('updating a session is scoped to its UUID and admin ownership', async () => {
+  const { repository, rows } = createRepositoryHarness();
+  const ownId = crypto.randomUUID();
+  const otherAdminId = crypto.randomUUID();
+  rows.set(ownId, {
+    id: ownId,
+    created_by: 'admin-1',
+    current_result: createTestSession(),
+    original_result: {},
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  rows.set(otherAdminId, {
+    id: otherAdminId,
+    created_by: 'admin-2',
+    current_result: { marker: 'must remain untouched' },
+    original_result: {},
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  const changedSession = { ...createTestSession(), status: 'final' as const };
+  const saved = await repository.saveCurrentSession('admin-1', changedSession);
+
+  assert.equal(saved.id, ownId);
+  assert.equal(rows.get(ownId)?.created_by, 'admin-1');
+  assert.equal((rows.get(ownId)?.current_result as MatchingSession).status, 'final');
+  assert.equal(rows.get(otherAdminId)?.created_by, 'admin-2');
+  assert.deepEqual(rows.get(otherAdminId)?.current_result, { marker: 'must remain untouched' });
+});
+
+test('session load errors preserve only safe database diagnostics', async () => {
+  const { repository } = createRepositoryHarness('select');
+
+  await assert.rejects(
+    () => repository.loadCurrentSession('admin-1'),
+    (error: unknown) => {
+      assert.ok(error instanceof MatchingSessionPersistenceError);
+      assert.equal(error.operation, 'load');
+      assert.equal(error.details.databaseErrorCode, '42501');
+      assert.equal(error.details.httpStatus, 403);
+      assert.doesNotMatch(JSON.stringify(error), /database details omitted/);
+      return true;
+    },
+  );
 });
 
 test('legacy session-demo is never persisted as matching_sessions.id', async () => {

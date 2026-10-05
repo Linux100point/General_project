@@ -83,17 +83,28 @@ test('preserves matching configuration failures for the route response', async (
   await assert.rejects(() => service.run(input), MatchingConfigurationError);
 });
 
-test('logs persistence failures with a fixed stage and safe error name', () => {
+test('logs session-load persistence failures with operation and safe database details', () => {
   const logged: unknown[][] = [];
   logMatchingRunFailure(
-    new MatchingSessionPersistenceError('update'),
-    'session-persistence',
+    new MatchingSessionPersistenceError('update', {
+      databaseErrorCode: '23505',
+      httpStatus: 409,
+      causeName: 'PostgrestError',
+    }),
+    'session-load',
     (...args) => logged.push(args),
   );
 
   assert.deepEqual(logged, [[
     'Matching run failed.',
-    { stage: 'session-persistence', errorName: 'MatchingSessionPersistenceError' },
+    {
+      stage: 'session-load',
+      errorName: 'MatchingSessionPersistenceError',
+      operation: 'update',
+      databaseErrorCode: '23505',
+      httpStatus: 409,
+      causeName: 'PostgrestError',
+    },
   ]]);
 });
 

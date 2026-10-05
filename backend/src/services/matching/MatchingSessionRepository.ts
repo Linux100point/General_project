@@ -13,15 +13,35 @@ export type MatchingSessionRepositoryRow = {
 
 export type MatchingSessionPersistenceOperation = 'load' | 'save' | 'update' | 'insert' | 'load-original';
 
-type PersistenceDatabaseError = { code?: string; message?: string } | null;
+type PersistenceDatabaseError = { code?: string; message?: string; name?: string; status?: number } | null;
 type PersistenceQueryResult = { data: unknown; error: PersistenceDatabaseError };
 type PersistenceMutationResult = { error: PersistenceDatabaseError };
+type PersistenceErrorDetails = {
+  databaseErrorCode?: string;
+  httpStatus?: number;
+  causeName?: string;
+};
 
 export class MatchingSessionPersistenceError extends Error {
-  constructor(readonly operation: MatchingSessionPersistenceOperation) {
+  constructor(
+    readonly operation: MatchingSessionPersistenceOperation,
+    readonly details: PersistenceErrorDetails = {},
+  ) {
     super('Unable to persist or load the matching session.');
     this.name = 'MatchingSessionPersistenceError';
   }
+}
+
+function toPersistenceError(operation: MatchingSessionPersistenceOperation, error: unknown): MatchingSessionPersistenceError {
+  const details = typeof error === 'object' && error !== null
+    ? error as { code?: unknown; status?: unknown; name?: unknown }
+    : {};
+
+  return new MatchingSessionPersistenceError(operation, {
+    ...(typeof details.code === 'string' ? { databaseErrorCode: details.code } : {}),
+    ...(typeof details.status === 'number' ? { httpStatus: details.status } : {}),
+    ...(typeof details.name === 'string' ? { causeName: details.name } : {}),
+  });
 }
 
 async function runPersistence<T>(
@@ -30,8 +50,11 @@ async function runPersistence<T>(
 ): Promise<T> {
   try {
     return await action();
-  } catch {
-    throw new MatchingSessionPersistenceError(operation);
+  } catch (error) {
+    if (error instanceof MatchingSessionPersistenceError) {
+      throw error;
+    }
+    throw toPersistenceError(operation, error);
   }
 }
 
@@ -90,7 +113,7 @@ export class SupabaseMatchingSessionRepository {
       .limit(1));
 
     if (error && error.code !== 'PGRST116') {
-      throw new MatchingSessionPersistenceError('load');
+      throw toPersistenceError('load', error);
     }
 
     const row = Array.isArray(data) ? data[0] : null;
@@ -118,7 +141,7 @@ export class SupabaseMatchingSessionRepository {
       .limit(1));
 
     if (queryError && queryError.code !== 'PGRST116') {
-      throw new MatchingSessionPersistenceError('save');
+      throw toPersistenceError('save', queryError);
     }
 
     const existingRow = Array.isArray(existingRows) ? existingRows[0] : null;
@@ -146,16 +169,19 @@ export class SupabaseMatchingSessionRepository {
     };
 
     if (existingRow) {
-      const { error } = await runPersistence<PersistenceMutationResult>('update', () => this.client!.from(this.tableName).update(row));
+      const { error } = await runPersistence<PersistenceMutationResult>('update', () => this.client!.from(this.tableName)
+        .update(row)
+        .eq('id', persistedSession.id)
+        .eq('created_by', adminUserId));
       if (error) {
-        throw new MatchingSessionPersistenceError('update');
+        throw toPersistenceError('update', error);
       }
       return persistedSession;
     }
 
     const { error } = await runPersistence<PersistenceMutationResult>('insert', () => this.client!.from(this.tableName).insert(row));
     if (error) {
-      throw new MatchingSessionPersistenceError('insert');
+      throw toPersistenceError('insert', error);
     }
 
     return persistedSession;
@@ -186,7 +212,7 @@ export class SupabaseMatchingSessionRepository {
       .limit(1));
 
     if (error && error.code !== 'PGRST116') {
-      throw new MatchingSessionPersistenceError('load-original');
+      throw toPersistenceError('load-original', error);
     }
 
     const row = Array.isArray(data) ? data[0] : null;

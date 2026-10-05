@@ -47,6 +47,22 @@ export function logMatchingRunFailure(
     return;
   }
 
+  if (error instanceof Error && error.name === 'MatchingSessionPersistenceError') {
+    const persistenceError = error as Error & { operation?: unknown; details?: unknown };
+    const details = typeof persistenceError.details === 'object' && persistenceError.details !== null
+      ? persistenceError.details as { databaseErrorCode?: unknown; httpStatus?: unknown; causeName?: unknown }
+      : {};
+    logger('Matching run failed.', {
+      stage: fallbackStage,
+      errorName: error.name,
+      ...(typeof persistenceError.operation === 'string' ? { operation: persistenceError.operation } : {}),
+      ...(typeof details.databaseErrorCode === 'string' ? { databaseErrorCode: details.databaseErrorCode } : {}),
+      ...(typeof details.httpStatus === 'number' ? { httpStatus: details.httpStatus } : {}),
+      ...(typeof details.causeName === 'string' ? { causeName: details.causeName } : {}),
+    });
+    return;
+  }
+
   logger('Matching run failed.', {
     stage: fallbackStage,
     errorName: error instanceof Error ? error.name : 'UnknownError',
