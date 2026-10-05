@@ -5,7 +5,7 @@ import { MentorCVExtractionService, type MentorProfileExtractor } from './Mentor
 import { MatchingSessionPersistenceError } from './MatchingSessionRepository';
 import { OpenAIMatchingService } from './OpenAIMatchingService';
 import { MatchingConfigurationError } from './OpenAIProvider';
-import { MatchingRunStageError, logMatchingRunFailure, matchingRunFailureResponse } from './MatchingRunDiagnostics';
+import { MatchingRunStageError, logMatchingRunFailure, logMatchingRunInputRejection, matchingRunFailureResponse } from './MatchingRunDiagnostics';
 
 const input: MatchRequestInput = {
   mentors: [{ id: 'mentor-safe-id', name: 'Mentor', cvFileIds: ['file-safe-id'] }],
@@ -118,6 +118,27 @@ test('logs session-load persistence failures with operation and safe database de
       createdByMatchesAdmin: true,
     },
   ]]);
+});
+
+test('logs matching input rejection reason and cohort counts without user data', () => {
+  const logged: unknown[][] = [];
+  logMatchingRunInputRejection(
+    'student-count-out-of-range',
+    { mentorCount: 5, studentCount: 18 },
+    (...args) => logged.push(args),
+  );
+
+  assert.deepEqual(logged, [[
+    'Matching run rejected.',
+    {
+      stage: 'matching-input-validation',
+      errorName: 'MatchingInputError',
+      reason: 'student-count-out-of-range',
+      mentorCount: 5,
+      studentCount: 18,
+    },
+  ]]);
+  assert.doesNotMatch(JSON.stringify(logged), /S00|Student|Mentor/);
 });
 
 test('diagnostic logs and the client response exclude raw secret text', () => {

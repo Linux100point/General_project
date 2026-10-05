@@ -6,8 +6,10 @@ import { MatchingConfigurationError } from './OpenAIProvider';
 
 export type ReadMentorCv = (mentor: Mentor) => Promise<Buffer>;
 
+export type MatchingInputErrorReason = 'mentor-count-out-of-range' | 'student-count-out-of-range';
+
 export class MatchingInputError extends Error {
-  constructor(message: string) {
+  constructor(message: string, readonly reason: MatchingInputErrorReason) {
     super(message);
     this.name = 'MatchingInputError';
   }
@@ -27,10 +29,10 @@ export class OpenAIMatchingService implements MatchingService {
 
   async run(input: Parameters<MatchingService['run']>[0]) {
     if (input.mentors.length < 1 || input.mentors.length > 5) {
-      throw new MatchingInputError('OpenAI matching supports one to five mentors per cohort.');
+      throw new MatchingInputError('OpenAI matching supports one to five mentors per cohort.', 'mentor-count-out-of-range');
     }
     if (input.students.length < 5 || input.students.length > 17) {
-      throw new MatchingInputError('OpenAI matching requires five to seventeen students per cohort.');
+      throw new MatchingInputError('OpenAI matching requires five to seventeen students per cohort.', 'student-count-out-of-range');
     }
 
     const mentorProfiles = await this.extractMentorProfiles(input.mentors);

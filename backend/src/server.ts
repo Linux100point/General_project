@@ -17,7 +17,7 @@ import { applyUploadedMentorCvFiles, reconcileMentorCvSession, resolveMentorCvFi
 import { InMemoryMentorProfileCache, MentorCVExtractionService, OpenAIMentorProfileExtractor } from './services/matching/MentorCVExtractionService';
 import { MatchingConfigurationError, OpenAIProvider } from './services/matching/OpenAIProvider';
 import { MatchingInputError, OpenAIMatchingService } from './services/matching/OpenAIMatchingService';
-import { createMatchingRunStageError, logMatchingRunFailure, matchingRunFailureResponse, type MatchingRunStage } from './services/matching/MatchingRunDiagnostics';
+import { createMatchingRunStageError, logMatchingRunFailure, logMatchingRunInputRejection, matchingRunFailureResponse, type MatchingRunStage } from './services/matching/MatchingRunDiagnostics';
 import { BasicExportService, getExportMetadata } from './services/export/ExportService';
 import { enforceFinalAssignmentConstraint, buildUnassignedStudents } from './services/matching/MatchingBusinessRules';
 import { MatchingSessionPersistenceError, SupabaseMatchingSessionRepository } from './services/matching/MatchingSessionRepository';
@@ -312,14 +312,21 @@ app.post('/api/admin/matching/upload-students-excel', requireAdmin, studentUploa
 
 app.post('/api/admin/matching/run', requireAdmin, safeAsyncRoute(async (req, res) => {
   let stage: MatchingRunStage = 'session-load';
+  let cohortCounts: { mentorCount: number; studentCount: number } | undefined;
   try {
     const user = (req as AuthenticatedRequest).user;
     const session = await getSessionForAdmin(user!.id);
+    cohortCounts = {
+      mentorCount: session.mentors.length,
+      studentCount: session.students.length,
+    };
     if (!session.students.length) {
+      logMatchingRunInputRejection('students-missing', cohortCounts);
       return res.status(400).json({ error: 'Student Excel file must be uploaded before running matching.' });
     }
 
     if (!session.mentors.length) {
+      logMatchingRunInputRejection('mentors-missing', cohortCounts);
       return res.status(400).json({ error: 'At least one mentor CV must be uploaded before running matching.' });
     }
 
@@ -352,6 +359,9 @@ app.post('/api/admin/matching/run', requireAdmin, safeAsyncRoute(async (req, res
       return res.status(503).json({ error: 'AI matching is selected but OPENAI_API_KEY is not configured on the backend.' });
     }
     if (error instanceof MatchingInputError) {
+      if (cohortCounts) {
+        logMatchingRunInputRejection(error.reason, cohortCounts);
+      }
       return res.status(400).json({ error: error.message });
     }
     logMatchingRunFailure(error, stage);

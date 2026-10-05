@@ -1,5 +1,6 @@
 export type MatchingRunStage =
   | 'session-load'
+  | 'matching-input-validation'
   | 'mentor-file-record'
   | 'mentor-cv-read'
   | 'mentor-cv-extraction'
@@ -13,6 +14,27 @@ export type MatchingRunDiagnosticDetails = {
   fileRecordExists?: boolean;
   storageObjectPathPresent?: boolean;
 };
+
+export type MatchingRunRejectionReason =
+  | 'students-missing'
+  | 'mentors-missing'
+  | 'mentor-count-out-of-range'
+  | 'student-count-out-of-range';
+
+export function logMatchingRunInputRejection(
+  reason: MatchingRunRejectionReason,
+  counts: { mentorCount: number; studentCount: number },
+  logger: (message: string, details: Record<string, unknown>) => void = console.warn,
+): void {
+  const sessionValidation = reason === 'students-missing' || reason === 'mentors-missing';
+  logger('Matching run rejected.', {
+    stage: sessionValidation ? 'session-load' : 'matching-input-validation',
+    errorName: 'MatchingInputError',
+    reason,
+    mentorCount: counts.mentorCount,
+    studentCount: counts.studentCount,
+  });
+}
 
 export class MatchingRunStageError extends Error {
   constructor(
