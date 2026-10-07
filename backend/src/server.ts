@@ -7,7 +7,7 @@ import OpenAI from 'openai';
 import { isSupabaseConfigured } from './auth';
 import { getFrontendOrigin, getSupabaseInviteRedirectUrl, isProductionEnvironment } from './config/runtimeConfig';
 import { supabaseAdmin } from './supabase';
-import { requireAdmin, requireAuth } from './middleware/adminAuth';
+import { requireAdmin, requireAdminWithForbiddenUnauthenticated, requireAuth } from './middleware/adminAuth';
 import { safeAsyncRoute } from './middleware/safeAsyncRoute';
 import { LocalFileStorage, SupabaseFileStorage, createStorageProvider, createSupabaseStorageClient } from './services/storage/LocalFileStorage';
 import { parseStudentsExcel } from './services/excel/StudentExcelParser';
@@ -17,6 +17,7 @@ import { applyUploadedMentorCvFiles, reconcileMentorCvSession, resolveMentorCvFi
 import { InMemoryMentorProfileCache, MentorCVExtractionService, OpenAIMentorProfileExtractor } from './services/matching/MentorCVExtractionService';
 import { MatchingConfigurationError, OpenAIProvider } from './services/matching/OpenAIProvider';
 import { MatchingInputError, OpenAIMatchingService } from './services/matching/OpenAIMatchingService';
+import { createMatchingSessionDiagnosticsHandler } from './services/matching/MatchingSessionDiagnostics';
 import { createMatchingRunStageError, logMatchingRunFailure, logMatchingRunInputRejection, matchingRunFailureResponse, type MatchingRunStage } from './services/matching/MatchingRunDiagnostics';
 import { BasicExportService, getExportMetadata } from './services/export/ExportService';
 import { enforceFinalAssignmentConstraint, buildUnassignedStudents } from './services/matching/MatchingBusinessRules';
@@ -229,6 +230,14 @@ app.get('/api/admin/matching/session', requireAdmin, safeAsyncRoute(async (req, 
   res.json({ session });
 }));
 
+app.get(
+  '/api/admin/matching/diagnostics',
+  requireAdminWithForbiddenUnauthenticated,
+  safeAsyncRoute(createMatchingSessionDiagnosticsHandler((adminUserId) => (
+    sessionRepository.loadCurrentSessionSnapshot(adminUserId, 'session-diagnostic')
+  ))),
+);
+
 app.post('/api/admin/matching/upload-mentor-cvs', requireAdmin, mentorUpload.array('files', 5), safeAsyncRoute(async (req, res) => {
   try {
     const user = (req as AuthenticatedRequest).user;
@@ -265,12 +274,25 @@ app.post('/api/admin/matching/upload-mentor-cvs', requireAdmin, mentorUpload.arr
       updatedAt: new Date().toISOString(),
     };
     const savedSession = await sessionRepository.saveCurrentSession(user!.id, nextSession);
-    console.info('Matching mentor CV upload persisted.', {
-      uploadedFileCount: savedFiles.length,
-      mentorCount: savedSession.mentors.length,
-      uploadedMentorFileCount: savedSession.uploadedMentorFiles.filter((file) => file.kind === 'mentor-cv').length,
-      studentCount: savedSession.students.length,
-    });
+    try {
+      const reloadedSession = await sessionRepository.loadCurrentSession(user!.id, 'mentor-upload-reload');
+      console.info('Matching upload lifecycle.', {
+        type: 'mentor',
+        sessionId: savedSession.id,
+        receivedFileCount: uploadedFiles.length,
+        persistedFileRecordCount: savedFiles.length,
+        mentorCountBeforeSave: nextSession.mentors.length,
+        mentorCountAfterSave: savedSession.mentors.length,
+        mentorCountAfterReload: reloadedSession.mentors.length,
+        reloadSessionMatchesSavedSession: reloadedSession.id === savedSession.id,
+      });
+    } catch (error) {
+      console.warn('Matching upload reload diagnostic unavailable.', {
+        type: 'mentor',
+        sessionId: savedSession.id,
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+      });
+    }
     return res.json({ success: true, session: savedSession });
   } catch (error) {
     await removeTemporaryUploads(req.files as Express.Multer.File[] | undefined);
@@ -305,12 +327,24 @@ app.post('/api/admin/matching/upload-students-excel', requireAdmin, studentUploa
     };
 
     const savedSession = await sessionRepository.saveCurrentSession(user!.id, nextSession);
-    console.info('Matching student spreadsheet upload persisted.', {
-      parsedStudentCount: parsedStudents.length,
-      persistedStudentCount: savedSession.students.length,
-      mentorCount: savedSession.mentors.length,
-      uploadedMentorFileCount: savedSession.uploadedMentorFiles.filter((mentorFile) => mentorFile.kind === 'mentor-cv').length,
-    });
+    try {
+      const reloadedSession = await sessionRepository.loadCurrentSession(user!.id, 'student-upload-reload');
+      console.info('Matching upload lifecycle.', {
+        type: 'students',
+        sessionId: savedSession.id,
+        parsedStudentRowCount: parsedStudents.length,
+        studentCountBeforeSave: nextSession.students.length,
+        studentCountAfterSave: savedSession.students.length,
+        studentCountAfterReload: reloadedSession.students.length,
+        reloadSessionMatchesSavedSession: reloadedSession.id === savedSession.id,
+      });
+    } catch (error) {
+      console.warn('Matching upload reload diagnostic unavailable.', {
+        type: 'students',
+        sessionId: savedSession.id,
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+      });
+    }
     return res.json({ success: true, session: savedSession });
   } catch (error) {
     if (error instanceof MatchingSessionPersistenceError) {

@@ -11,6 +11,12 @@ export type MatchingSessionRepositoryRow = {
   updated_at?: string;
 };
 
+export type MatchingSessionLoadSnapshot = {
+  session: MatchingSession;
+  rowCount: number;
+  selectedUpdatedAt: string | null;
+};
+
 export type MatchingSessionPersistenceOperation = 'load' | 'save' | 'update' | 'insert' | 'load-original';
 export type MatchingSessionDatabaseOperation =
   | 'session-select'
@@ -152,8 +158,25 @@ export class SupabaseMatchingSessionRepository {
   }
 
   async loadCurrentSession(adminUserId: string, stage = 'session-load'): Promise<MatchingSession> {
+    const snapshot = await this.loadCurrentSessionData(adminUserId, stage, false);
+    return snapshot.session;
+  }
+
+  async loadCurrentSessionSnapshot(adminUserId: string, stage = 'session-load'): Promise<MatchingSessionLoadSnapshot> {
+    return this.loadCurrentSessionData(adminUserId, stage, true);
+  }
+
+  private async loadCurrentSessionData(
+    adminUserId: string,
+    stage: string,
+    includeExactRowCount: boolean,
+  ): Promise<MatchingSessionLoadSnapshot> {
     if (!this.client) {
-      return this.getDefaultSession();
+      return {
+        session: this.getDefaultSession(),
+        rowCount: 0,
+        selectedUpdatedAt: null,
+      };
     }
 
     const context: PersistenceDiagnosticContext = {
@@ -165,8 +188,8 @@ export class SupabaseMatchingSessionRepository {
       rowFound: null,
       createdByMatchesAdmin: null,
     };
-    const { data, error } = await runPersistence<PersistenceQueryResult>('load', context, () => this.client!.from(this.tableName)
-      .select('*')
+    const { data, error, count } = await runPersistence<PersistenceQueryResult & { count?: number | null }>('load', context, () => this.client!.from(this.tableName)
+      .select('*', includeExactRowCount ? { count: 'exact' } : undefined)
       .eq('created_by', adminUserId)
       .order('updated_at', { ascending: false })
       .limit(1), this.diagnosticLogger);
@@ -177,13 +200,21 @@ export class SupabaseMatchingSessionRepository {
 
     const row = Array.isArray(data) ? data[0] : null;
     if (!row) {
-      return this.getDefaultSession();
+      return {
+        session: this.getDefaultSession(),
+        rowCount: count ?? 0,
+        selectedUpdatedAt: null,
+      };
     }
 
     const fallback = this.getDefaultSession();
     return {
-      ...this.coerceSession(row.current_result ?? row.original_result ?? null, fallback),
-      id: row.id,
+      session: {
+        ...this.coerceSession(row.current_result ?? row.original_result ?? null, fallback),
+        id: row.id,
+      },
+      rowCount: count ?? (Array.isArray(data) ? data.length : 0),
+      selectedUpdatedAt: typeof row.updated_at === 'string' ? row.updated_at : null,
     };
   }
 

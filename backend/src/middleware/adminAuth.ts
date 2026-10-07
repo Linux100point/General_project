@@ -2,12 +2,12 @@ import type { NextFunction, Request, Response } from 'express';
 import { isSupabaseConfigured, resolveAuthenticatedUser } from '../auth';
 import type { AuthenticatedUser, UserRole } from '../types';
 
-export function requireAuth(req: Request, res: Response, next: NextFunction) {
+export function requireAuth(req: Request, res: Response, next: NextFunction, unauthenticatedStatus = 401) {
   const authHeader = req.headers.authorization;
   const bearerToken = typeof authHeader === 'string' ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
 
   if (!bearerToken) {
-    return res.status(401).json({
+    return res.status(unauthenticatedStatus).json({
       error: 'Unauthorized',
       message: 'Authentication required.',
     });
@@ -23,7 +23,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
   void resolveAuthenticatedUser(bearerToken)
     .then((user) => {
       if (!user) {
-        return res.status(401).json({
+        return res.status(unauthenticatedStatus).json({
           error: 'Unauthorized',
           message: 'Invalid session or application profile not provisioned.',
         });
@@ -53,7 +53,7 @@ export function requireRole(requiredRole: UserRole) {
   };
 }
 
-export function requireAdmin(req: Request, res: Response, next: NextFunction) {
+export function requireAdmin(req: Request, res: Response, next: NextFunction, unauthenticatedStatus = 401) {
   return requireAuth(req, res, () => {
     const user = (req as Request & { user?: AuthenticatedUser }).user;
 
@@ -65,5 +65,9 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction) {
     }
 
     return next();
-  });
+  }, unauthenticatedStatus);
+}
+
+export function requireAdminWithForbiddenUnauthenticated(req: Request, res: Response, next: NextFunction) {
+  return requireAdmin(req, res, next, 403);
 }
