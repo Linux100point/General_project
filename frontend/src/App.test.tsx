@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiRequestError, getActionErrorMessage } from './actionErrors';
 import { MatchingDashboard } from './App';
@@ -36,6 +36,44 @@ const persistedSession = {
   uploadedMentorFiles: [],
 };
 
+function createManualAssignmentSession(finalAssignments: Array<{ mentorId: string; studentId: string }> = []) {
+  return {
+    mentors: [
+      { id: 'mentor-one', name: 'Mentor One', cvFileIds: [] },
+      { id: 'mentor-two', name: 'Mentor Two', cvFileIds: [] },
+    ],
+    students: [
+      { id: 'student-a', studentId: 'S001', name: 'Student A', desiredSkills: '', topicsForExpertConsultation: '', projectOverview: '', mentorshipSupportNeeds: '' },
+      { id: 'student-b', studentId: 'S002', name: 'Student B', desiredSkills: '', topicsForExpertConsultation: '', projectOverview: '', mentorshipSupportNeeds: '' },
+    ],
+    currentRecommendations: [
+      { id: 'ai-a', mentorId: 'mentor-one', studentId: 'student-a', score: 88, reason: 'AI reason for Student A.', category: 'selected' as const, source: 'ai' as const },
+      { id: 'ai-b', mentorId: 'mentor-two', studentId: 'student-b', score: 72, reason: 'AI reason for Student B.', category: 'alternative' as const, source: 'ai' as const },
+    ],
+    originalRecommendations: [
+      { id: 'ai-a', mentorId: 'mentor-one', studentId: 'student-a', score: 88, reason: 'AI reason for Student A.', category: 'selected' as const, source: 'ai' as const },
+      { id: 'ai-b', mentorId: 'mentor-two', studentId: 'student-b', score: 72, reason: 'AI reason for Student B.', category: 'alternative' as const, source: 'ai' as const },
+    ],
+    finalAssignments,
+    uploadedMentorFiles: [],
+  };
+}
+
+function getMentorCard(mentorName: string): HTMLElement {
+  const heading = screen.getByRole('heading', { name: mentorName });
+  return heading.parentElement?.parentElement as HTMLElement;
+}
+
+function getFinalAssignmentSection(mentorName: string) {
+  const card = within(getMentorCard(mentorName));
+  return within(card.getByText('FINAL ASSIGNMENTS').parentElement as HTMLElement);
+}
+
+function getUnassignedSection() {
+  const heading = screen.getByRole('heading', { name: 'Unassigned Students' });
+  return within(heading.parentElement as HTMLElement);
+}
+
 function response(status: number, payload: unknown) {
   return {
     ok: status >= 200 && status < 300,
@@ -72,7 +110,7 @@ describe('MatchingDashboard', () => {
     render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
 
     expect(await screen.findByRole('heading', { name: 'Persisted Mentor' })).toBeTruthy();
-    expect(screen.getByText('Persisted Student')).toBeTruthy();
+    expect(screen.getAllByText('Persisted Student').length).toBeGreaterThan(0);
     expect(Array.from(document.querySelectorAll('p')).some((paragraph) => paragraph.textContent?.includes('Loaded from the persisted session.'))).toBe(true);
 
     const sessionRequest = requests.find(([input]) => new URL(String(input)).pathname === '/api/admin/matching/session');
@@ -142,6 +180,378 @@ describe('MatchingDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
 
     expect(await screen.findByRole('alert')).toHaveProperty('textContent', 'Could not reach the server. Check your connection and try again.');
+  });
+
+  it('requires an explicit student choice and assigns different students to different mentors', async () => {
+    const initialSession = createManualAssignmentSession();
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session: initialSession });
+      return response(200, { success: true, session: initialSession });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+
+    const addForMentorOne = screen.getAllByRole('button', { name: 'Add student' })[0];
+    expect((addForMentorOne as HTMLButtonElement).disabled).toBe(true);
+    const selectForMentorOne = screen.getByRole('combobox', { name: 'Choose unassigned student for Mentor One' });
+    fireEvent.change(selectForMentorOne, { target: { value: 'student-b' } });
+    fireEvent.click(addForMentorOne);
+
+    const mentorOneAssignments = getFinalAssignmentSection('Mentor One');
+    expect(mentorOneAssignments.getByText('Student B')).toBeTruthy();
+    expect(getUnassignedSection().getByText('Student A')).toBeTruthy();
+    expect(getUnassignedSection().queryByText('S002 — Student B')).toBeNull();
+
+    const selectForMentorTwo = screen.getByRole('combobox', { name: 'Choose unassigned student for Mentor Two' });
+    fireEvent.change(selectForMentorTwo, { target: { value: 'student-a' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Add student' })[1]);
+
+    expect(getFinalAssignmentSection('Mentor One').getByText('Student B')).toBeTruthy();
+    expect(getFinalAssignmentSection('Mentor Two').getByText('Student A')).toBeTruthy();
+    expect(getFinalAssignmentSection('Mentor Two').getAllByText('Student A')).toHaveLength(1);
+    expect(screen.getByText('No unassigned students.')).toBeTruthy();
+    expect(getFinalAssignmentSection('Mentor Two').getByText('Added manually')).toBeTruthy();
+    expect(within(getMentorCard('Mentor Two')).getByText((_, element) => element?.textContent === 'Student B — 72%')).toBeTruthy();
+  });
+
+  it('renders an AI-recommended final assignment once with its score, full reason, and badge', async () => {
+    const session = {
+      ...createManualAssignmentSession([{ mentorId: 'mentor-one', studentId: 'student-a' }]),
+      currentRecommendations: [
+        { id: 'ai-a', mentorId: 'mentor-one', studentId: 'student-a', score: 99, reason: 'Full explanation: the mentor has directly relevant Spring Boot and PostgreSQL experience for this project.', category: 'selected' as const, source: 'ai' as const },
+        { id: 'duplicate-alt-a', mentorId: 'mentor-one', studentId: 'student-a', score: 81, reason: 'A duplicate alternative record.', category: 'alternative' as const, source: 'ai' as const },
+        { id: 'alt-b', mentorId: 'mentor-one', studentId: 'student-b', score: 72, reason: 'Valid alternative.', category: 'alternative' as const, source: 'ai' as const },
+      ],
+    };
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session });
+      return response(200, { success: true, session });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+
+    const mentorCard = within(getMentorCard('Mentor One'));
+    expect(mentorCard.getAllByText('Student A')).toHaveLength(1);
+    expect(mentorCard.getByText('99%')).toBeTruthy();
+    expect(mentorCard.getByText('Why: Full explanation: the mentor has directly relevant Spring Boot and PostgreSQL experience for this project.')).toBeTruthy();
+    expect(mentorCard.getByText('AI recommendation')).toBeTruthy();
+    expect(mentorCard.queryByText('AI SELECTED RECOMMENDATIONS')).toBeNull();
+    expect(mentorCard.getByText('Student B')).toBeTruthy();
+    expect(mentorCard.queryByText('A duplicate alternative record.')).toBeNull();
+  });
+
+  it('uses the known student identity instead of a placeholder and preserves real names containing Student', async () => {
+    const session = {
+      ...createManualAssignmentSession(),
+      students: [
+        { id: 'internal-student-b', studentId: 'S017', name: 'Example Student Name', desiredSkills: '', topicsForExpertConsultation: '', projectOverview: '', mentorshipSupportNeeds: '' },
+        { id: 'internal-student-c', studentId: 'S018', name: 'Student 3', desiredSkills: '', topicsForExpertConsultation: '', projectOverview: '', mentorshipSupportNeeds: '' },
+      ],
+      currentRecommendations: [
+        { id: 'alt-known', mentorId: 'mentor-one', studentId: 'S017', score: 81, reason: 'Known real student.', category: 'alternative' as const, source: 'ai' as const },
+        { id: 'alt-missing', mentorId: 'mentor-one', studentId: 'S099', score: 78, reason: 'Unknown student record.', category: 'alternative' as const, source: 'ai' as const },
+        { id: 'alt-placeholder', mentorId: 'mentor-one', studentId: 'S018', score: 74, reason: 'Placeholder name with a known student ID.', category: 'alternative' as const, source: 'ai' as const },
+      ],
+      finalAssignments: [],
+    };
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session });
+      return response(200, { success: true, session });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+
+    const mentorCard = within(getMentorCard('Mentor One'));
+    expect(mentorCard.getByText('Example Student Name')).toBeTruthy();
+    expect(mentorCard.getByText((_, element) => element?.textContent === 'Example Student Name — 81%')).toBeTruthy();
+    expect(mentorCard.queryByText('S017')).toBeNull();
+    expect(mentorCard.queryByText('S099')).toBeNull();
+    expect(mentorCard.queryByText('S018')).toBeNull();
+    expect(mentorCard.queryByText((_, element) => element?.textContent === 'S017 — 81%')).toBeNull();
+    expect(mentorCard.queryByText((_, element) => element?.textContent === 'S099 — 78%')).toBeNull();
+    expect(mentorCard.queryByText((_, element) => element?.textContent === 'S018 — 74%')).toBeNull();
+    expect(mentorCard.queryByText('Student 3')).toBeNull();
+  });
+
+  it('does not render duplicate final assignment cards for the same student', async () => {
+    const session = createManualAssignmentSession([
+      { mentorId: 'mentor-one', studentId: 'student-a' },
+      { mentorId: 'mentor-one', studentId: 'student-a' },
+      { mentorId: 'mentor-two', studentId: 'student-a' },
+    ]);
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session });
+      return response(200, { success: true, session });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+
+    expect(getFinalAssignmentSection('Mentor One').getAllByText('Student A')).toHaveLength(1);
+    expect(getFinalAssignmentSection('Mentor Two').queryByText('Student A')).toBeNull();
+  });
+
+  it('accounts for all 17 uploaded students when 14 have final assignments', async () => {
+    const students = Array.from({ length: 17 }, (_, index) => ({
+      id: `internal-${index + 1}`,
+      studentId: `S${String(index + 1).padStart(3, '0')}`,
+      name: `Learner Name ${index + 1}`,
+      desiredSkills: '',
+      topicsForExpertConsultation: '',
+      projectOverview: '',
+      mentorshipSupportNeeds: '',
+    }));
+    const finalAssignments = students.slice(0, 14).map((student, index) => ({
+      mentorId: index % 2 === 0 ? 'mentor-one' : 'mentor-two',
+      studentId: student.studentId,
+    }));
+    const session = { ...createManualAssignmentSession(), students, finalAssignments };
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session });
+      return response(200, { success: true, session });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+
+    const assignedNames = [
+      ...getFinalAssignmentSection('Mentor One').getAllByText(/^Learner Name \d+$/),
+      ...getFinalAssignmentSection('Mentor Two').getAllByText(/^Learner Name \d+$/),
+    ];
+    expect(assignedNames).toHaveLength(14);
+    for (const [index, student] of students.slice(0, 14).entries()) {
+      const mentorName = finalAssignments[index].mentorId === 'mentor-one' ? 'Mentor One' : 'Mentor Two';
+      expect(getFinalAssignmentSection(mentorName).getAllByText(student.name)).toHaveLength(1);
+      expect(getUnassignedSection().queryByText(student.name)).toBeNull();
+    }
+    for (const student of students.slice(14)) {
+      expect(getUnassignedSection().getByText(student.name)).toBeTruthy();
+    }
+  });
+
+  it('returns assignments with unknown mentors to Unassigned Students', async () => {
+    const session = createManualAssignmentSession([{ mentorId: 'deleted-mentor', studentId: 'student-a' }]);
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session });
+      return response(200, { success: true, session });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+
+    expect(getFinalAssignmentSection('Mentor One').queryByText('Student A')).toBeNull();
+    expect(getFinalAssignmentSection('Mentor Two').queryByText('Student A')).toBeNull();
+    expect(getUnassignedSection().getByText('Student A')).toBeTruthy();
+  });
+
+  it('keeps a student mentioned by duplicate recommendations unassigned unless finalAssignments assigns them', async () => {
+    const session = {
+      ...createManualAssignmentSession(),
+      currentRecommendations: [
+        { id: 'selected-one', mentorId: 'mentor-one', studentId: 'student-a', score: 91, reason: 'First recommendation.', category: 'selected' as const, source: 'ai' as const },
+        { id: 'selected-two', mentorId: 'mentor-two', studentId: 'student-a', score: 87, reason: 'Duplicate recommendation.', category: 'selected' as const, source: 'ai' as const },
+      ],
+      finalAssignments: [],
+    };
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session });
+      return response(200, { success: true, session });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+
+    expect(getUnassignedSection().getByText('Student A')).toBeTruthy();
+    expect(getFinalAssignmentSection('Mentor One').queryByText('Student A')).toBeNull();
+    expect(getFinalAssignmentSection('Mentor Two').queryByText('Student A')).toBeNull();
+  });
+
+  it('does not count recommendations in Alternatives as final assignments', async () => {
+    const session = {
+      ...createManualAssignmentSession(),
+      currentRecommendations: [
+        { id: 'alternative-only', mentorId: 'mentor-one', studentId: 'student-b', score: 81, reason: 'Alternative only.', category: 'alternative' as const, source: 'ai' as const },
+        { id: 'selected-for-another', mentorId: 'mentor-two', studentId: 'student-b', score: 77, reason: 'Another mentor recommendation.', category: 'selected' as const, source: 'ai' as const },
+      ],
+      finalAssignments: [],
+    };
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session });
+      return response(200, { success: true, session });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+
+    expect(getUnassignedSection().getByText('Student B')).toBeTruthy();
+    expect(getFinalAssignmentSection('Mentor One').queryByText('Student B')).toBeNull();
+    expect(getFinalAssignmentSection('Mentor Two').queryByText('Student B')).toBeNull();
+    expect(within(getMentorCard('Mentor One')).getByText((_, element) => element?.textContent?.replace(/\s+/g, ' ').trim() === 'Student B — 81%')).toBeTruthy();
+  });
+
+  it('assigns the chosen unassigned student and keeps the other student unassigned until selected', async () => {
+    const initialSession = createManualAssignmentSession();
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session: initialSession });
+      return response(200, { success: true, session: initialSession });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Choose unassigned student for Mentor One' }), { target: { value: 'student-a' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Add student' })[0]);
+
+    expect(getFinalAssignmentSection('Mentor One').getByText('Student A')).toBeTruthy();
+    expect(getUnassignedSection().getByText('Student B')).toBeTruthy();
+    expect(getUnassignedSection().queryByText('Student A')).toBeNull();
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Choose unassigned student for Mentor Two' }), { target: { value: 'student-b' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Add student' })[1]);
+    expect(getFinalAssignmentSection('Mentor One').getByText('Student A')).toBeTruthy();
+    expect(getFinalAssignmentSection('Mentor Two').getByText('Student B')).toBeTruthy();
+    expect(screen.getByText('No unassigned students.')).toBeTruthy();
+  });
+
+  it('does not automatically assign the first unassigned student when another is explicitly selected', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session: createManualAssignmentSession() });
+      return response(200, { success: true, session: createManualAssignmentSession() });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Choose unassigned student for Mentor One' }), { target: { value: 'student-b' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Add student' })[0]);
+
+    const finalAssignments = getFinalAssignmentSection('Mentor One');
+    expect(finalAssignments.getByText('Student B')).toBeTruthy();
+    expect(finalAssignments.queryByText('Student A')).toBeNull();
+    expect(getUnassignedSection().getByText('Student A')).toBeTruthy();
+  });
+
+  it('moves a student to one mentor and removing the assignment returns the student to unassigned', async () => {
+    const initialSession = createManualAssignmentSession([
+      { mentorId: 'mentor-one', studentId: 'student-a' },
+      { mentorId: 'mentor-two', studentId: 'student-b' },
+    ]);
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session: initialSession });
+      return response(200, { success: true, session: initialSession });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Move Student A to mentor' }), { target: { value: 'mentor-two' } });
+
+    expect(getFinalAssignmentSection('Mentor One').queryByText('Student A')).toBeNull();
+    expect(getFinalAssignmentSection('Mentor Two').getByText('Student A')).toBeTruthy();
+    expect(getFinalAssignmentSection('Mentor Two').getByText('Student B')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove Student A from Mentor Two' }));
+    expect(getFinalAssignmentSection('Mentor Two').queryByText('Student A')).toBeNull();
+    expect(getUnassignedSection().getByText('Student A')).toBeTruthy();
+    expect(getFinalAssignmentSection('Mentor Two').getByText('Student B')).toBeTruthy();
+  });
+
+  it('reset restores original AI assignments without changing AI recommendations', async () => {
+    const originalSession = createManualAssignmentSession([{ mentorId: 'mentor-one', studentId: 'student-a' }]);
+    let currentSession = originalSession;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session: currentSession });
+      if (path === '/api/admin/matching/reset') {
+        currentSession = {
+          ...currentSession,
+          finalAssignments: originalSession.finalAssignments,
+          currentRecommendations: originalSession.originalRecommendations,
+        };
+        return response(200, { success: true, session: currentSession });
+      }
+      return response(200, { success: true, session: currentSession });
+    });
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Move Student A to mentor' }), { target: { value: 'mentor-two' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Reset to AI Recommendations' }));
+
+    await screen.findByText('Recommendations restored successfully.');
+    expect(getFinalAssignmentSection('Mentor One').getByText('Student A')).toBeTruthy();
+    expect(getFinalAssignmentSection('Mentor Two').queryByText('Student A')).toBeNull();
+    expect(screen.getByText('Why: AI reason for Student A.')).toBeTruthy();
+    expect(within(getMentorCard('Mentor Two')).getByText((_, element) => element?.textContent === 'Student B — 72%')).toBeTruthy();
+  });
+
+  it('saves manual final assignments and retains them when the session is reloaded', async () => {
+    let currentSession = createManualAssignmentSession();
+    let savedBody: Record<string, unknown> | undefined;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push([input, init]);
+      const path = new URL(String(input)).pathname;
+      if (path === '/api/health') return response(200, { status: 'ok' });
+      if (path === '/api/admin/matching/session') return response(200, { session: currentSession });
+      if (path === '/api/admin/matching/save') {
+        savedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        currentSession = { ...currentSession, finalAssignments: savedBody.finalAssignments as typeof currentSession.finalAssignments };
+        return response(200, { success: true, session: currentSession });
+      }
+      return response(200, { success: true, session: currentSession });
+    });
+
+    const firstRender = render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Choose unassigned student for Mentor Two' }), { target: { value: 'student-b' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Add student' })[1]);
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+    await screen.findByText('Changes saved successfully.');
+
+    expect(savedBody?.finalAssignments).toEqual([{ mentorId: 'mentor-two', studentId: 'student-b' }]);
+    expect(currentSession.currentRecommendations).toEqual(currentSession.originalRecommendations);
+    firstRender.unmount();
+
+    render(<MatchingDashboard sessionToken="diagnostic-access-token" />);
+    await screen.findByRole('heading', { name: 'Mentor One' });
+    const mentorTwoAssignments = getFinalAssignmentSection('Mentor Two');
+    expect(mentorTwoAssignments.getByText('Student B')).toBeTruthy();
+    expect(getUnassignedSection().getByText('Student A')).toBeTruthy();
   });
 });
 

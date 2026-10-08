@@ -3,6 +3,16 @@ import type { FormEvent } from 'react';
 import { buildApiUrl } from './config';
 import { supabase } from './supabase';
 import { ApiRequestError, getActionErrorMessage } from './actionErrors';
+import {
+  assignStudentToMentor,
+  getAlternativeStudentName,
+  getCanonicalStudentId,
+  getUnassignedStudents,
+  getStudentDisplayName,
+  getUniqueAssignments,
+  removeStudentAssignment,
+  reorderMentorAssignment,
+} from './matchingAssignments';
 
 type Role = 'ADMIN' | 'STUDENT' | 'MENTOR';
 
@@ -58,6 +68,13 @@ type SessionState = {
   uploadedStudentFile?: { originalName?: string };
 };
 
+type AssignmentCardItem = {
+  id: string;
+  mentorId: string;
+  studentId: string;
+  recommendation?: Recommendation;
+};
+
 const defaultSession: SessionState = {
   mentors: [],
   students: [],
@@ -67,17 +84,22 @@ const defaultSession: SessionState = {
   uploadedMentorFiles: [],
 };
 
-function getFinalAssignmentsFromRecommendations(recommendations: Recommendation[]) {
-  const selected = recommendations.filter((item) => item.category === 'selected');
-  const byStudent = new Map<string, Recommendation>();
-
-  for (const item of [...selected].sort((a, b) => b.score - a.score)) {
-    if (!byStudent.has(item.studentId)) {
-      byStudent.set(item.studentId, item);
-    }
-  }
-
-  return Array.from(byStudent.values()).map((item) => ({ mentorId: item.mentorId, studentId: item.studentId }));
+function normalizeSession(value: Partial<SessionState>): SessionState {
+  const mentors = value.mentors ?? [];
+  const students = value.students ?? [];
+  return {
+    mentors,
+    students,
+    currentRecommendations: value.currentRecommendations ?? [],
+    originalRecommendations: value.originalRecommendations ?? [],
+    finalAssignments: getUniqueAssignments(
+      value.finalAssignments ?? [],
+      students,
+      mentors.map((mentor) => mentor.id),
+    ),
+    uploadedMentorFiles: value.uploadedMentorFiles ?? [],
+    uploadedStudentFile: value.uploadedStudentFile,
+  };
 }
 
 export function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
@@ -89,6 +111,7 @@ export function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
   const [sessionLoading, setSessionLoading] = useState(true);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  const [selectedStudentByMentor, setSelectedStudentByMentor] = useState<Record<string, string>>({});
   const mentorInputRef = useRef<HTMLInputElement>(null);
   const studentInputRef = useRef<HTMLInputElement>(null);
 
@@ -122,15 +145,7 @@ export function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
         const result = await response.json();
         if (!result.session) throw new Error('Matching session response was empty.');
         if (active) {
-          setSession({
-            mentors: result.session.mentors ?? [],
-            students: result.session.students ?? [],
-            currentRecommendations: result.session.currentRecommendations ?? [],
-            originalRecommendations: result.session.originalRecommendations ?? [],
-            finalAssignments: result.session.finalAssignments ?? [],
-            uploadedMentorFiles: result.session.uploadedMentorFiles ?? [],
-            uploadedStudentFile: result.session.uploadedStudentFile,
-          });
+          setSession(normalizeSession(result.session));
         }
       } catch (error) {
         if (active) setActionError(getActionErrorMessage(error));
@@ -163,21 +178,55 @@ export function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
 
     const result = await response.json();
     if (result.session) {
-      setSession(result.session);
+      setSession(normalizeSession(result.session));
     }
   };
 
   const mentorCards = useMemo(() => {
+    const mentorIds = session.mentors.map((mentor) => mentor.id);
+    const validAssignments = getUniqueAssignments(session.finalAssignments, session.students, mentorIds);
+
     return session.mentors.map((mentor) => {
-      const selected = session.currentRecommendations.filter((item) => item.mentorId === mentor.id && item.category === 'selected');
-      const alternatives = session.currentRecommendations.filter((item) => item.mentorId === mentor.id && item.category === 'alternative');
-      return { mentor, selected, alternatives };
+      const finalAssignments: AssignmentCardItem[] = validAssignments
+        .filter((assignment) => assignment.mentorId === mentor.id)
+        .map((assignment) => {
+          const recommendation = session.currentRecommendations
+            .filter((item) => (
+              item.mentorId === mentor.id
+              && getCanonicalStudentId(session.students, item.studentId) === assignment.studentId
+            ))
+            .sort((left, right) => {
+              if (left.category !== right.category) return left.category === 'selected' ? -1 : 1;
+              return right.score - left.score;
+            })[0];
+          return {
+            id: `assignment-${assignment.studentId}-${mentor.id}`,
+            mentorId: mentor.id,
+            studentId: assignment.studentId,
+            recommendation,
+          };
+        });
+      const assignedStudentIds = new Set(finalAssignments.map((assignment) => assignment.studentId));
+      const alternatives = session.currentRecommendations.flatMap((item) => {
+        if (
+          item.mentorId !== mentor.id
+          || item.category !== 'alternative'
+        ) return [];
+        const studentId = getCanonicalStudentId(session.students, item.studentId);
+        if (!studentId || assignedStudentIds.has(studentId)) return [];
+        const studentName = getAlternativeStudentName(session.students, item.studentId);
+        return studentName ? [{ ...item, studentName }] : [];
+      });
+      return { mentor, finalAssignments, alternatives };
     });
   }, [session]);
 
   const unassignedStudents = useMemo(() => {
-    const assignedIds = new Set(getFinalAssignmentsFromRecommendations(session.currentRecommendations).map((item) => item.studentId));
-    return session.students.filter((student) => !assignedIds.has(student.id));
+    return getUnassignedStudents(
+      session.students,
+      session.finalAssignments,
+      session.mentors.map((mentor) => mentor.id),
+    );
   }, [session]);
 
   const performAction = async (action: () => Promise<void>, successMessage: string) => {
@@ -229,7 +278,11 @@ export function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
   };
 
   const handleSaveChanges = async () => {
-    const finalAssignments = getFinalAssignmentsFromRecommendations(session.currentRecommendations);
+    const finalAssignments = getUniqueAssignments(
+      session.finalAssignments,
+      session.students,
+      session.mentors.map((mentor) => mentor.id),
+    );
     await performAction(async () => {
       await updateCurrentSessionFromServer('/api/admin/matching/save', 'POST', { finalAssignments });
     }, 'Changes saved successfully.');
@@ -259,64 +312,38 @@ export function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
 
   const reorderSelected = (mentorId: string, studentId: string, direction: 'up' | 'down') => {
     setSession((current) => {
-      const selectedItems = current.currentRecommendations.filter((item) => item.mentorId === mentorId && item.category === 'selected');
-      const index = selectedItems.findIndex((item) => item.studentId === studentId);
-      if (index === -1) return current;
-
-      const targetIndex = direction === 'up' ? index - 1 : index + 1;
-      if (targetIndex < 0 || targetIndex >= selectedItems.length) return current;
-
-      const reordered = [...selectedItems];
-      const [movedItem] = reordered.splice(index, 1);
-      reordered.splice(targetIndex, 0, movedItem);
-
-      const otherItems = current.currentRecommendations.filter((item) => !(item.mentorId === mentorId && item.category === 'selected'));
-      return { ...current, currentRecommendations: [...otherItems, ...reordered] };
+      const finalAssignments = reorderMentorAssignment(current.finalAssignments, mentorId, studentId, direction);
+      return finalAssignments === current.finalAssignments ? current : { ...current, finalAssignments };
     });
   };
 
-  const removeSelectedStudent = (mentorId: string, studentId: string) => {
+  const removeSelectedStudent = (_mentorId: string, studentId: string) => {
     setSession((current) => ({
       ...current,
-      currentRecommendations: current.currentRecommendations.filter((item) => !(item.mentorId === mentorId && item.studentId === studentId && item.category === 'selected')),
+      finalAssignments: removeStudentAssignment(current.finalAssignments, studentId),
     }));
+    setSelectedStudentByMentor({});
   };
 
   const moveStudentBetweenMentors = (studentId: string, targetMentorId: string) => {
     setSession((current) => {
-      const selectedStudentAssignments = current.currentRecommendations.filter((item) => item.studentId === studentId && item.category === 'selected');
-      const existingTarget = selectedStudentAssignments.find((item) => item.mentorId === targetMentorId);
-      if (existingTarget) return current;
-
-      const nextRecommendations = current.currentRecommendations.filter((item) => !(item.studentId === studentId && item.category === 'selected'));
-      const movedRecommendation = selectedStudentAssignments[0];
-
-      if (!movedRecommendation) {
-        const availableCandidate = current.currentRecommendations.find((item) => item.studentId === studentId);
-        if (!availableCandidate) return current;
-        nextRecommendations.push({ ...availableCandidate, mentorId: targetMentorId, category: 'selected', source: 'manual' });
-        return { ...current, currentRecommendations: nextRecommendations };
-      }
-
-      nextRecommendations.push({ ...movedRecommendation, mentorId: targetMentorId, source: 'manual' });
-      return { ...current, currentRecommendations: nextRecommendations };
+      const finalAssignments = assignStudentToMentor(current.finalAssignments, studentId, targetMentorId);
+      return finalAssignments === current.finalAssignments ? current : { ...current, finalAssignments };
     });
+    setSelectedStudentByMentor({});
   };
 
-  const addStudentToMentor = (mentorId: string) => {
+  const addStudentToMentor = (mentorId: string, studentId: string) => {
     setSession((current) => {
-      const usedStudentIds = new Set(current.currentRecommendations.filter((item) => item.category === 'selected').map((item) => item.studentId));
-      const candidate = current.students.find((student) => !usedStudentIds.has(student.id));
-      if (!candidate) return current;
-
+      const isKnownStudent = current.students.some((student) => student.id === studentId);
+      const isUnassigned = !current.finalAssignments.some((assignment) => assignment.studentId === studentId);
+      if (!isKnownStudent || !isUnassigned) return current;
       return {
         ...current,
-        currentRecommendations: [
-          ...current.currentRecommendations,
-          { id: `manual-${candidate.id}-${mentorId}`, mentorId, studentId: candidate.id, score: 88, reason: 'Added manually by admin.', category: 'selected', source: 'manual' },
-        ],
+        finalAssignments: assignStudentToMentor(current.finalAssignments, studentId, mentorId),
       };
     });
+    setSelectedStudentByMentor({});
   };
 
   return (
@@ -372,46 +399,73 @@ export function MatchingDashboard({ sessionToken }: { sessionToken: string }) {
         <section style={{ marginBottom: '24px' }}>
           <h2 style={{ marginBottom: '16px' }}>Mentor cards</h2>
           <div style={{ display: 'grid', gap: '20px', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))' }}>
-            {mentorCards.map(({ mentor, selected, alternatives }) => (
+            {mentorCards.map(({ mentor, finalAssignments, alternatives }) => (
               <div key={mentor.id} style={{ background: '#ffffff', borderRadius: '16px', padding: '20px', boxShadow: '0 10px 30px rgba(0,0,0,0.08)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
                   <h3 style={{ margin: 0 }}>{mentor.name}</h3>
-                  <button type="button" onClick={() => addStudentToMentor(mentor.id)} style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', background: '#fff' }}>Add student</button>
+                </div>
+                <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+                  <label htmlFor={`unassigned-student-${mentor.id}`} style={{ position: 'absolute', width: '1px', height: '1px', padding: 0, margin: '-1px', overflow: 'hidden', clip: 'rect(0, 0, 0, 0)', whiteSpace: 'nowrap', border: 0 }}>
+                    Choose unassigned student for {mentor.name}
+                  </label>
+                  <select
+                    id={`unassigned-student-${mentor.id}`}
+                    aria-label={`Choose unassigned student for ${mentor.name}`}
+                    value={selectedStudentByMentor[mentor.id] ?? ''}
+                    onChange={(event) => setSelectedStudentByMentor((current) => ({ ...current, [mentor.id]: event.target.value }))}
+                    disabled={!unassignedStudents.length}
+                    style={{ flex: 1, minWidth: 0, padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', background: '#fff' }}
+                  >
+                    <option value="">Choose an unassigned student</option>
+                    {unassignedStudents.map((student) => (
+                      <option key={student.id} value={student.id}>{student.studentId ? `${student.studentId} — ` : ''}{student.name}</option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => addStudentToMentor(mentor.id, selectedStudentByMentor[mentor.id] ?? '')}
+                    disabled={!selectedStudentByMentor[mentor.id] || !unassignedStudents.length}
+                    style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', background: '#fff' }}
+                  >
+                    Add student
+                  </button>
                 </div>
 
                 <div style={{ marginBottom: '12px' }}>
-                  <p style={{ margin: '0 0 8px', fontWeight: 700 }}>SELECTED</p>
-                  {selected.length ? selected.map((item, index) => {
-                    const student = session.students.find((candidate) => candidate.id === item.studentId);
+                  <p style={{ margin: '0 0 8px', fontWeight: 700 }}>FINAL ASSIGNMENTS</p>
+                  {finalAssignments.length ? finalAssignments.map((item, index) => {
+                    const studentName = getStudentDisplayName(session.students, item.studentId);
                     return (
-                      <div key={item.id} style={{ background: '#f8fafc', borderRadius: '10px', padding: '10px 12px', marginBottom: '8px' }}>
+                      <div key={item.id} style={{ background: '#ecfdf5', borderRadius: '10px', padding: '10px 12px', marginBottom: '8px' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', alignItems: 'center' }}>
-                          <strong>{student?.name ?? 'Student'}</strong>
-                          <span>{item.score}%</span>
+                          <strong>{studentName}</strong>
+                          <span>{item.recommendation ? `${item.recommendation.score}%` : '—'}</span>
                         </div>
-                        <p style={{ margin: '6px 0 8px' }}>Why: {item.reason}</p>
-                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' }}>
-                          <button type="button" onClick={() => reorderSelected(mentor.id, item.studentId, 'up')} disabled={index === 0}>↑</button>
-                          <button type="button" onClick={() => reorderSelected(mentor.id, item.studentId, 'down')} disabled={index === selected.length - 1}>↓</button>
-                          <button type="button" onClick={() => removeSelectedStudent(mentor.id, item.studentId)}>Remove</button>
+                        <span style={{ display: 'inline-block', marginTop: '4px', padding: '3px 8px', borderRadius: '999px', background: item.recommendation ? '#dbeafe' : '#f3f4f6', color: item.recommendation ? '#1d4ed8' : '#374151', fontSize: '12px', fontWeight: 700 }}>
+                          {item.recommendation ? 'AI recommendation' : 'Added manually'}
+                        </span>
+                        {item.recommendation && <p style={{ margin: '8px 0' }}>Why: {item.recommendation.reason}</p>}
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', margin: '8px 0' }}>
+                          <button type="button" aria-label={`Move ${studentName} up`} onClick={() => reorderSelected(mentor.id, item.studentId, 'up')} disabled={index === 0}>↑</button>
+                          <button type="button" aria-label={`Move ${studentName} down`} onClick={() => reorderSelected(mentor.id, item.studentId, 'down')} disabled={index === finalAssignments.length - 1}>↓</button>
+                          <button type="button" aria-label={`Remove ${studentName} from ${mentor.name}`} onClick={() => removeSelectedStudent(mentor.id, item.studentId)}>Remove</button>
                         </div>
                         <label style={{ display: 'block', fontSize: '12px', color: '#374151', marginBottom: '4px' }}>Move to mentor</label>
-                        <select value={mentor.id} onChange={(event) => moveStudentBetweenMentors(item.studentId, event.target.value)} style={{ width: '100%', padding: '6px 8px', borderRadius: '8px', border: '1px solid #cbd5e1' }}>
+                        <select aria-label={`Move ${studentName} to mentor`} value={mentor.id} onChange={(event) => moveStudentBetweenMentors(item.studentId, event.target.value)} style={{ width: '100%', padding: '6px 8px', borderRadius: '8px', border: '1px solid #cbd5e1' }}>
                           {session.mentors.map((mentorOption) => (
                             <option key={mentorOption.id} value={mentorOption.id}>{mentorOption.name}</option>
                           ))}
                         </select>
                       </div>
                     );
-                  }) : <p style={{ margin: 0, color: '#6b7280' }}>No selected students.</p>}
+                  }) : <p style={{ margin: 0, color: '#6b7280' }}>No final assignments.</p>}
                 </div>
 
                 <div>
                   <p style={{ margin: '0 0 8px', fontWeight: 700 }}>ALTERNATIVES</p>
                   {alternatives.length ? alternatives.map((item) => {
-                    const student = session.students.find((candidate) => candidate.id === item.studentId);
                     const assignmentText = item.assignedToMentorId ? ` — assigned to ${session.mentors.find((m) => m.id === item.assignedToMentorId)?.name ?? 'another mentor'}` : '';
-                    return <div key={item.id} style={{ background: '#f8fafc', borderRadius: '10px', padding: '10px 12px', marginBottom: '8px' }}><strong>{student?.name ?? 'Student'}</strong> — {item.score}%{assignmentText}</div>;
+                    return <div key={item.id} style={{ background: '#f8fafc', borderRadius: '10px', padding: '10px 12px', marginBottom: '8px' }}><strong>{item.studentName}</strong> — {item.score}%{assignmentText}</div>;
                   }) : <p style={{ margin: 0, color: '#6b7280' }}>No alternatives.</p>}
                 </div>
               </div>
